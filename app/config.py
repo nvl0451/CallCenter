@@ -6,8 +6,8 @@ class Settings(BaseModel):
     # OpenAI settings
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-    openai_fallback_model: str = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
     openai_use_responses: bool = bool(int(os.getenv("OPENAI_USE_RESPONSES", "1")))
+    openai_embed_model: str = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 
     sqlite_path: str = os.getenv("SQLITE_PATH", "./callcenter.sqlite3")
     chroma_dir: str = os.getenv("CHROMA_DIR", "./chroma_db")
@@ -21,5 +21,10 @@ class Settings(BaseModel):
     # Feature flags
     enable_rag: bool = bool(int(os.getenv("ENABLE_RAG", "0")))
     enable_vision: bool = bool(int(os.getenv("ENABLE_VISION", "0")))
+
+    # RAG chunking/embeddings
+    rag_use_openai_embeddings: bool = bool(int(os.getenv("RAG_USE_OPENAI_EMBEDDINGS", "1")))
+    rag_chunk_chars: int = int(os.getenv("RAG_CHUNK_CHARS", "800"))
+    rag_chunk_overlap: int = int(os.getenv("RAG_CHUNK_OVERLAP", "120"))
 
 settings = Settings()

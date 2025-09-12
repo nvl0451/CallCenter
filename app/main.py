@@ -133,16 +133,24 @@ async def rag_ask(req: AskRequest):
         raise HTTPException(503, "RAG disabled via ENABLE_RAG=0")
     if not rag_available:
         raise HTTPException(503, rag_unavailable_reason or "RAG dependencies unavailable")
-    docs = search(req.question, top_k=req.top_k)
+    try:
+        docs = search(req.question, top_k=req.top_k)
+    except Exception as e:
+        raise HTTPException(500, f"RAG search failed: {e}")
     # Сформируем подсказку с цитатами
-    context = "\n\n".join([f"[DOC {i+1}]\n" + d["document"] for i, d in enumerate(docs)])
+    if not docs:
+        return AskResponse(answer="В базе знаний пока нет документов.", sources=[])
+    context = "\n\n".join([f"[DOC {i+1}]\n" + (d.get("document") or "") for i, d in enumerate(docs)])
     sys = SYSTEM_BASE + "\nОтвечай, используя только факты из [DOC]. Если чего‑то нет в документах — честно скажи."
     messages = [
         {"role": "system", "content": sys},
         {"role": "user", "content": f"Вопрос: {req.question}\n\nКонтекст:\n{context}"},
     ]
-    answer, _, _ = await llm_client.chat(messages)
-    return AskResponse(answer=answer, sources=[{"id": d["id"], "score": d["score"]} for d in docs])
+    try:
+        answer, _, _ = await llm_client.chat(messages)
+    except Exception as e:
+        raise HTTPException(502, f"LLM call failed: {e}")
+    return AskResponse(answer=answer or "", sources=[{"id": d.get("id"), "score": d.get("score")} for d in docs])
 
 # ---------- Vision ----------
 # Only register upload endpoint if vision enabled AND deps for multipart are present

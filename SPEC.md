@@ -3,7 +3,7 @@
 Готовый one‑shot пакет: скормите этот документ **codex CLI** и получите рабочее решение.
 
 > **Что внутри**
-> - FastAPI‑сервис с LLM‑агентом (OpenRouter, модель по умолчанию `openrouter/sonoma-dusk-alpha`)
+> - FastAPI‑сервис с LLM‑агентом (OpenAI, по умолчанию `gpt-5-mini`, поддержка Chat/Responses)
 > - Промпт‑система для типов запросов (поддержка/продажи/жалобы)
 > - Хранение контекста диалога (SQLite)
 > - RAG: ChromaDB + sentence‑transformers (эмбеддинги) + QA endpoint
@@ -64,12 +64,12 @@ python-multipart>=0.0.9
 
 ## 🔐 .env.example
 ```env
-# Ключ OpenRouter
-OPENROUTER_API_KEY=sk-or-...
-# Модель по умолчанию
-OPENROUTER_MODEL=openrouter/sonoma-dusk-alpha
-# Идентификатор/бренд для OpenRouter (необязательно, но рекомендуется)
-OPENROUTER_APP_NAME=callcenter-ai
+# Ключ OpenAI
+OPENAI_API_KEY=sk-...
+# Модель по умолчанию (gpt‑5 требует Responses API)
+OPENAI_MODEL=gpt-5-mini
+# Использовать OpenAI Responses API (1) или Chat Completions (0)
+OPENAI_USE_RESPONSES=1
 
 # Параметры БД
 SQLITE_PATH=./callcenter.sqlite3
@@ -78,8 +78,10 @@ SQLITE_PATH=./callcenter.sqlite3
 CHROMA_DIR=./chroma_db
 
 # Тюнинги LLM
-LLM_MAX_TOKENS=512
 LLM_TEMPERATURE=0.2
+# Лимиты на токены (ответ / классификация)
+REPLY_MAX_TOKENS=256
+CLASSIFY_MAX_TOKENS=16
 ```
 
 ---
@@ -102,15 +104,17 @@ import os
 from pydantic import BaseModel
 
 class Settings(BaseModel):
-    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
-    openrouter_model: str = os.getenv("OPENROUTER_MODEL", "openrouter/sonoma-dusk-alpha")
-    openrouter_app_name: str = os.getenv("OPENROUTER_APP_NAME", "callcenter-ai")
+    # OpenAI
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+    openai_use_responses: bool = bool(int(os.getenv("OPENAI_USE_RESPONSES", "1")))
 
     sqlite_path: str = os.getenv("SQLITE_PATH", "./callcenter.sqlite3")
     chroma_dir: str = os.getenv("CHROMA_DIR", "./chroma_db")
 
-    llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "512"))
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+    reply_max_tokens: int = int(os.getenv("REPLY_MAX_TOKENS", "256"))
+    classify_max_tokens: int = int(os.getenv("CLASSIFY_MAX_TOKENS", "16"))
 
 settings = Settings()
 ```
@@ -240,42 +244,40 @@ def get_session_messages(session_id: str, limit: int = 20) -> List[Tuple[str,str
 
 ---
 
-## 🌐 app/llm.py (OpenRouter клиент + диалог)
+## 🌐 app/llm.py (OpenAI клиент + диалог)
 ```python
 from __future__ import annotations
-import time
-import httpx
 from typing import List, Dict
+from openai import OpenAI
 from .config import settings
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 class LLMClient:
     def __init__(self):
-        self.model = settings.openrouter_model
-        self.headers = {
-            "Authorization": f"Bearer {settings.openrouter_api_key}",
-            "HTTP-Referer": settings.openrouter_app_name,
-            "X-Title": settings.openrouter_app_name,
-        }
+        self.model = settings.openai_model
+        self.client = OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
 
-    async def chat(self, messages: List[Dict[str, str]], max_tokens: int = None, temperature: float = None):
-        t0 = time.perf_counter()
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens or settings.llm_max_tokens,
-            "temperature": temperature if temperature is not None else settings.llm_temperature,
-        }
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(OPENROUTER_URL, headers=self.headers, json=payload)
-            r.raise_for_status()
-            data = r.json()
-        t1 = time.perf_counter()
-        content = data["choices"][0]["message"]["content"].strip()
-        # Приблизительная оценка стоимости/токенов недоступна из коробки: ставим заглушку
-        cost_estimate = 0.0005 * len(" ".join([m['content'] for m in messages])) / 4
-        return content, int((t1 - t0) * 1000), float(cost_estimate)
+    async def chat(self, messages: List[Dict[str, str]], max_tokens: int | None = None, temperature: float | None = None):
+        if not self.client:
+            return "[offline] Нет OPENAI_API_KEY", 0, 0.0
+        # gpt‑5 → Responses API с минимальным reasoning, иначе — Chat Completions
+        if settings.openai_use_responses and self.model.startswith("gpt-5"):
+            text = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+            resp = self.client.responses.create(
+                model=self.model,
+                input=text,
+                max_output_tokens=max_tokens or settings.reply_max_tokens,
+                reasoning={"effort": "minimal"},
+                text={"verbosity": "low"},
+            )
+            return (resp.output_text or "").strip(), 0, 0.0
+        else:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=max_tokens or settings.reply_max_tokens,
+                temperature=settings.llm_temperature if temperature is None else temperature,
+            )
+            return (resp.choices[0].message.content or "").strip(), 0, 0.0
 
 llm_client = LLMClient()
 ```
@@ -512,7 +514,7 @@ async def classify(file: UploadFile = File(...)):
 1. Python 3.10+
 2. `python -m venv .venv && source .venv/bin/activate`
 3. `pip install -r requirements.txt`
-4. Создайте `.env` из `.env.example` и пропишите `OPENROUTER_API_KEY`
+4. Создайте `.env` из `.env.example` и пропишите `OPENAI_API_KEY` (и `OPENAI_MODEL` при необходимости)
 5. `bash run.sh`
 
 ## Примеры запросов
@@ -539,8 +541,9 @@ curl -s -F 'file=@screenshot.png' http://localhost:8000/vision/classify
 ```
 
 ## Заметки по стоимости/скорости
-- Температура = 0.2; max_tokens = 512 — дешёвая, быстрая генерация.
-- Классификация идёт коротким вызовом LLM с `max_tokens=4`, `temperature=0.0`.
+- Температура = 0.2; REPLY_MAX_TOKENS по умолчанию 256.
+- Классификация идёт коротким вызовом LLM с `CLASSIFY_MAX_TOKENS=16`, `temperature=0.0`.
+- Для gpt‑5 используется OpenAI Responses с reasoning `minimal`.
 - Можно включить агрессивное триммирование истории (см. `history[-8:]`).
 
 ## Метрики/логи
@@ -563,4 +566,3 @@ curl -s -F 'file=@screenshot.png' http://localhost:8000/vision/classify
 - Генератор создаст описанные файлы и заполнит их содержимым.
 
 Удачи и мягких SLA! 🧃
-
