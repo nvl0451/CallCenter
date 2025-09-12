@@ -21,6 +21,28 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
+@app.get("/features")
+def features():
+    try:
+        import multipart  # type: ignore
+        mp = True
+    except Exception:
+        mp = False
+    return {
+        "model": getattr(settings, "openai_model", None),
+        "use_responses": getattr(settings, "openai_use_responses", None),
+        "reply_max_tokens": getattr(settings, "reply_max_tokens", None),
+        "classify_max_tokens": getattr(settings, "classify_max_tokens", None),
+        "rag": {"enabled": settings.enable_rag, "available": rag_available, "reason": rag_unavailable_reason},
+        "vision": {
+            "enabled": settings.enable_vision,
+            "available": vision_available,
+            "reason": vision_unavailable_reason,
+            "multipart": mp,
+            "backend": getattr(settings, "vision_backend", None),
+        },
+    }
+
 # ---------- Диалог ----------
 @app.post("/dialog/start", response_model=StartDialogResponse)
 def start_dialog(req: StartDialogRequest):
@@ -169,7 +191,10 @@ if settings.enable_vision and vision_available and multipart_available:
             raise HTTPException(400, "upload an image file")
         from PIL import Image  # lazy import to avoid startup crash if missing
         img = Image.open(file.file).convert("RGB")
-        category, conf, logits, labels = classify_image(img)
+        try:
+            category, conf, logits, labels = classify_image(img)
+        except Exception as e:
+            raise HTTPException(503, f"Vision backend error: {e}")
         return VisionResponse(category=category, confidence=conf, logits=logits, labels=labels)
 else:
     @app.post("/vision/classify", response_model=VisionResponse)

@@ -22,6 +22,11 @@ class Settings(BaseModel):
     enable_rag: bool = bool(int(os.getenv("ENABLE_RAG", "0")))
     enable_vision: bool = bool(int(os.getenv("ENABLE_VISION", "0")))
 
+    # Vision
+    openai_vision_model: str = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+    vision_backend: str = os.getenv("VISION_BACKEND", "openai")  # openai | clip
+    vision_allow_insecure_download: bool = bool(int(os.getenv("VISION_ALLOW_INSECURE_DOWNLOAD", "0")))
+
     # RAG chunking/embeddings
     rag_use_openai_embeddings: bool = bool(int(os.getenv("RAG_USE_OPENAI_EMBEDDINGS", "1")))
     rag_chunk_chars: int = int(os.getenv("RAG_CHUNK_CHARS", "800"))

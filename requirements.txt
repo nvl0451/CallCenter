@@ -5,7 +5,7 @@ pydantic>=2.7
 python-dotenv>=1.0
 openai>=1.51.0
 chromadb>=0.5.5
-numpy>=1.26
+numpy<2,>=1.26.4
 pandas>=2.2
 scikit-learn>=1.4
 # Optional deps (install manually if needed):
@@ -13,5 +13,5 @@ scikit-learn>=1.4
 # torch>=2.2                   # install per PyTorch instructions
 # torchvision>=0.17
 # open-clip-torch>=2.24        # vision (requires torch)
-# Pillow>=10.3                 # vision
-# python-multipart>=0.0.9      # file upload; installed automatically by FastAPI extras if needed
+Pillow>=10.3                   # vision image handling
+python-multipart>=0.0.9        # file upload
