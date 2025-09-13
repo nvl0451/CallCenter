@@ -19,6 +19,7 @@ class MessageResponse(BaseModel):
     reply: str
     cost_estimate_usd: float
     latency_ms: int
+    latencies: Optional[dict] = None
 
 class IngestRequest(BaseModel):
     documents: Optional[List[str]] = None  # сырые тексты

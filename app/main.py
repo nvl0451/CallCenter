@@ -98,10 +98,11 @@ def _extract_json(text: str) -> dict | None:
     except Exception:
         return None
 
-async def _classify(text: str) -> tuple[str, float]:
+async def _classify(text: str) -> tuple[str, float, dict]:
     # Если нет ключа — используем локальную эвристику
     if not settings.openai_api_key:
-        return _classify_heuristic(text)
+        cat, conf = _classify_heuristic(text)
+        return cat, conf, {"mode": "offline", "wall_ms": 0, "api_ms": 0, "attempts": 0}
     # Иначе — строго Responses (gpt‑5) с компактным индекс‑JSON. Попытаться с двумя форматами input.
     names = app_cache.classes_names()
     labels = names if names else ["техподдержка", "продажи", "жалоба"]
@@ -116,9 +117,12 @@ async def _classify(text: str) -> tuple[str, float]:
     attempts = 0
     data = {}
     raw_cat = ""; cat = ""; conf = 0.0
+    wall_t0 = _time.perf_counter()
+    api_ms_total = 0
     for shape in ("string", "content"):
         attempts += 1
         out, lat_ms = await llm_client.classify_json(cls_prompt, max_tokens=settings.classify_max_tokens, json_schema={}, shape=shape)
+        api_ms_total += int(lat_ms or 0)
         if out.startswith("[offline]") or out.startswith("[incomplete:"):
             err_note = out
             continue
@@ -148,6 +152,7 @@ async def _classify(text: str) -> tuple[str, float]:
             {"role": "user", "content": cls_prompt},
         ]
         out, lat_ms = await llm_client.classify_chat_json(chat_messages, max_tokens=settings.classify_max_tokens, model=cls_model)
+        api_ms_total += int(lat_ms or 0)
         data = _extract_json(out) or {}
         try:
             idx = int(data.get("index", data.get("i", 0)))
@@ -163,6 +168,7 @@ async def _classify(text: str) -> tuple[str, float]:
             cat = label_map[idx]
             conf = p
     # Debug output for classification (hidden by default)
+    wall_ms = int((_time.perf_counter() - wall_t0) * 1000)
     if getattr(settings, "debug_verbose", False):
         try:
             debug = {
@@ -176,6 +182,8 @@ async def _classify(text: str) -> tuple[str, float]:
                 "normalized_category": cat,
                 "llm_latency_ms": lat_ms,
                 "attempts": attempts,
+                "api_ms_total": api_ms_total,
+                "wall_ms": wall_ms,
             }
             print("[cls-debug] " + _json.dumps(debug, ensure_ascii=False))
         except Exception:
@@ -193,11 +201,12 @@ async def _classify(text: str) -> tuple[str, float]:
             print("[cls-debug-final] " + _json.dumps({"mode":"llm","final_category": cat, "confidence": conf}, ensure_ascii=False))
         except Exception:
             pass
-    return cat, conf
+    return cat, conf, {"attempts": attempts, "api_ms": api_ms_total, "wall_ms": wall_ms}
 
 @app.post("/dialog/message", response_model=MessageResponse)
 async def send_message(req: MessageRequest):
     session_id, user_text = req.session_id, req.message
+    req_t0 = _time.perf_counter()
     # контекст
     history = get_session_messages(session_id)
     if not history:
@@ -205,7 +214,9 @@ async def send_message(req: MessageRequest):
     add_message(session_id, "user", user_text)
 
     # классификация
-    category, confidence = await _classify(user_text)
+    cls_t0 = _time.perf_counter()
+    category, confidence, cls_meta = await _classify(user_text)
+    cls_wall_ms = int((_time.perf_counter() - cls_t0) * 1000)
     # Choose system prompt: DB category prompt if available, else fallback
     db_prompts = app_cache.classes_prompts_map()
     sys_prompt = db_prompts.get(category) or PROMPTS_BY_TYPE.get(category, "")
@@ -217,7 +228,9 @@ async def send_message(req: MessageRequest):
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_text})
 
-    reply, latency_ms, cost = await llm_client.chat(messages)
+    rep_t0 = _time.perf_counter()
+    reply, reply_api_ms, cost = await llm_client.chat(messages)
+    reply_wall_ms = int((_time.perf_counter() - rep_t0) * 1000)
     # Если пришёл оффлайн/ошибочный ответ — добавим дружественное сообщение
     if reply.startswith("[offline]"):
         reply = (
@@ -227,7 +240,15 @@ async def send_message(req: MessageRequest):
         )
     add_message(session_id, "assistant", reply)
 
-    return MessageResponse(type=category, confidence=confidence, reply=reply, cost_estimate_usd=cost, latency_ms=latency_ms)
+    total_ms = int((_time.perf_counter() - req_t0) * 1000)
+    latencies = {
+        "classify_api_ms": int(cls_meta.get("api_ms", 0)),
+        "classify_wall_ms": cls_wall_ms,
+        "reply_api_ms": reply_api_ms,
+        "reply_wall_ms": reply_wall_ms,
+        "total_ms": total_ms,
+    }
+    return MessageResponse(type=category, confidence=confidence, reply=reply, cost_estimate_usd=cost, latency_ms=reply_api_ms, latencies=latencies)
 
 # ---------- RAG ----------
 @app.post("/rag/ingest")
