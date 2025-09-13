@@ -102,79 +102,94 @@ async def _classify(text: str) -> tuple[str, float]:
     # Если нет ключа — используем локальную эвристику
     if not settings.openai_api_key:
         return _classify_heuristic(text)
-    # Иначе пробуем LLM c JSON-ответом, при ошибке — эвристика
-    # Build category list from DB cache if present
+    # Иначе — строго Responses (gpt‑5) с компактным индекс‑JSON. Попытаться с двумя форматами input.
     names = app_cache.classes_names()
-    if names:
-        cats_str = ", ".join(names)
-        prompt = (
-            "Классифицируй пользовательский запрос в одну категорию из: "
-            f"[{cats_str}]. Верни строго JSON без пояснений: {{\\\"category\\\":\\\"<категория>\\\",\\\"confidence\\\":<0..1>}}.\n\n"
-            f"Запрос: {text}"
-        )
-    else:
-        prompt = CLASSIFY_PROMPT.format(text=text)
-    # Try Responses (gpt-5) minimal reasoning; if model rejects or 5xx occurs, use Chat with classify_model for this microtask
-    out = ""
-    lat_ms = 0
-    use_responses = bool(getattr(settings, "openai_use_responses", True)) and str(getattr(settings, "openai_model", "")).startswith("gpt-5")
-    err_note = None
-    if use_responses:
-        schema = {
-            "type": "object",
-            "properties": {
-                "category": {"type": "string", "enum": names if names else ["техподдержка", "продажи", "жалоба"]},
-                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-            },
-            "required": ["category", "confidence"],
-            "additionalProperties": False,
-        }
-        out, lat_ms = await llm_client.classify_json(prompt, max_tokens=settings.classify_max_tokens, json_schema=schema)
+    labels = names if names else ["техподдержка", "продажи", "жалоба"]
+    label_map = {i: lbl for i, lbl in enumerate(labels)}
+    cls_prompt = (
+        "Категории: " + "; ".join(f"{i}={lbl}" for i, lbl in label_map.items()) + ". "
+        "Верни строго один JSON без пробелов и переносов: {\"i\":<0|1|2>,\"p\":<0..1>}. "
+        "Только JSON. Запрос: " + text
+    )
+    out = ""; lat_ms = 0; err_note = None
+    attempts = 0
+    data = {}
+    raw_cat = ""; cat = ""; conf = 0.0
+    for shape in ("string", "content"):
+        attempts += 1
+        out, lat_ms = await llm_client.classify_json(cls_prompt, max_tokens=settings.classify_max_tokens, json_schema={}, shape=shape)
         if out.startswith("[offline]") or out.startswith("[incomplete:"):
             err_note = out
-    if (not use_responses) or err_note:
-        # Chat fallback for classifier ONLY (no heuristics): require JSON object
-        cls_model = getattr(settings, "classify_model", "gpt-4o-mini")
+            continue
+        data = _extract_json(out) or {}
+        try:
+            idx = int(data.get("i")) if "i" in data else None
+        except Exception:
+            idx = None
+        try:
+            p = float(data.get("p", 0.0))
+        except Exception:
+            p = 0.0
+        p = max(0.0, min(1.0, p))
+        if isinstance(idx, int) and idx in label_map:
+            cat = label_map[idx]
+            conf = p
+            raw_cat = cat
+            break
+        err_note = f"parse_error:{shape}"
+
+    # Опционально: fallback на Chat (OpenAI) только если включено
+    if not cat and getattr(settings, "fallback_classifier", False):
+        cls_model = getattr(settings, "classify_chat_model", "gpt-4o-mini")
         chat_messages = [
             {"role": "system", "content": "Верни строго JSON объект без пояснений."},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": cls_prompt},
         ]
         out, lat_ms = await llm_client.classify_chat_json(chat_messages, max_tokens=settings.classify_max_tokens, model=cls_model)
-    data = _extract_json(out) or {}
-    raw_cat = str(data.get("category", ""))
-    cat = _normalize_category(raw_cat)
-    try:
-        conf = float(data.get("confidence", 0.7))
-    except Exception:
-        conf = 0.7
-    conf = max(0.0, min(1.0, conf))
-    # Debug output for classification
-    try:
-        debug = {
-            "cls_strict": settings.classify_strict,
-            "model": getattr(settings, "openai_model", None),
-            "cats_from_db": names,
-            "prompt": prompt,
-            "raw_output": out,
-            "parsed": data,
-            "raw_category": raw_cat,
-            "normalized_category": cat,
-            "llm_latency_ms": lat_ms,
-        }
-        print("[cls-debug] " + _json.dumps(debug, ensure_ascii=False))
-    except Exception:
-        pass
-    if not cat:
-        # Strict: no heuristic; fail clearly
+        data = _extract_json(out) or {}
         try:
-            print("[cls-debug-final] " + _json.dumps({"mode":"strict-fail","reason": err_note or "normalize_empty", "raw": out}, ensure_ascii=False))
+            idx = int(data.get("i")) if "i" in data else None
+        except Exception:
+            idx = None
+        try:
+            p = float(data.get("p", 0.0))
+        except Exception:
+            p = 0.0
+        p = max(0.0, min(1.0, p))
+        if isinstance(idx, int) and idx in label_map:
+            cat = label_map[idx]
+            conf = p
+    # Debug output for classification (hidden by default)
+    if getattr(settings, "debug_verbose", False):
+        try:
+            debug = {
+                "cls_strict": settings.classify_strict,
+                "model": getattr(settings, "openai_model", None),
+                "cats_from_db": names,
+                "prompt": cls_prompt,
+                "raw_output": out,
+                "parsed": data,
+                "raw_category": raw_cat,
+                "normalized_category": cat,
+                "llm_latency_ms": lat_ms,
+                "attempts": attempts,
+            }
+            print("[cls-debug] " + _json.dumps(debug, ensure_ascii=False))
         except Exception:
             pass
+    if not cat:
+        # Strict: no heuristic; fail clearly
+        if getattr(settings, "debug_verbose", False):
+            try:
+                print("[cls-debug-final] " + _json.dumps({"mode":"strict-fail","reason": err_note or "normalize_empty", "raw": out}, ensure_ascii=False))
+            except Exception:
+                pass
         raise HTTPException(502, "classifier_failed")
-    try:
-        print("[cls-debug-final] " + _json.dumps({"mode":"llm","final_category": cat, "confidence": conf}, ensure_ascii=False))
-    except Exception:
-        pass
+    if getattr(settings, "debug_verbose", False):
+        try:
+            print("[cls-debug-final] " + _json.dumps({"mode":"llm","final_category": cat, "confidence": conf}, ensure_ascii=False))
+        except Exception:
+            pass
     return cat, conf
 
 @app.post("/dialog/message", response_model=MessageResponse)

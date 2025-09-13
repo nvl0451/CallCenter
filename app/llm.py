@@ -42,17 +42,18 @@ class LLMClient:
                     d = resp.to_dict()
                 except Exception:
                     d = {}
-                try:
-                    import json as _json
-                    summary = {
-                        "status": d.get("status"),
-                        "incomplete": (d.get("incomplete_details") or {}).get("reason"),
-                        "max_output_tokens": want_tokens,
-                        "output_len": len(content),
-                    }
-                    print("[llm-reply-debug] " + _json.dumps(summary, ensure_ascii=False))
-                except Exception:
-                    pass
+                if getattr(settings, "debug_verbose", False):
+                    try:
+                        import json as _json
+                        summary = {
+                            "status": d.get("status"),
+                            "incomplete": (d.get("incomplete_details") or {}).get("reason"),
+                            "max_output_tokens": want_tokens,
+                            "output_len": len(content),
+                        }
+                        print("[llm-reply-debug] " + _json.dumps(summary, ensure_ascii=False))
+                    except Exception:
+                        pass
                 if not content:
                     # Fallback to dict walk
                     try:
@@ -74,7 +75,7 @@ class LLMClient:
                         reason = (d.get("incomplete_details") or {}).get("reason")
                         content = f"[incomplete:{reason or 'unknown'}]"
                     # Emit debug if still empty
-                    if not content:
+                    if not content and getattr(settings, "debug_verbose", False):
                         try:
                             import json as _json
                             print("[llm-debug] empty_output resp= " + _json.dumps(d)[:1500])
@@ -98,16 +99,20 @@ class LLMClient:
     async def chat(self, messages: List[Dict[str, str]], max_tokens: int = None, temperature: float = None):
         return await asyncio.to_thread(self._chat_sync, messages, max_tokens, temperature)
 
-    def _responses_json_sync(self, prompt: str, max_tokens: int, json_schema: dict):
+    def _responses_json_sync(self, prompt: str, max_tokens: int, json_schema: dict, shape: str = "string"):
         import time as _time
         t0 = _time.perf_counter()
         if not self.available or not self.client:
             t1 = _time.perf_counter()
             return "[offline] Нет ключа OPENAI_API_KEY — LLM отключён.", int((t1 - t0) * 1000)
         try:
+            if shape == "content":
+                _input = [{"type": "input_text", "text": prompt}]
+            else:
+                _input = prompt
             resp = self.client.responses.create(
                 model=self.model,
-                input=prompt,
+                input=_input,
                 max_output_tokens=max_tokens,
                 text={"verbosity": "low"},
                 reasoning={"effort": "minimal"},
@@ -125,7 +130,7 @@ class LLMClient:
                 if d.get("status") == "incomplete":
                     reason = (d.get("incomplete_details") or {}).get("reason")
                     content = f"[incomplete:{reason or 'unknown'}]"
-                if not content:
+                if not content and getattr(settings, "debug_verbose", False):
                     try:
                         import json as _json
                         print("[llm-debug] classify empty_output resp= " + _json.dumps(d)[:1500])
@@ -136,8 +141,8 @@ class LLMClient:
             t1 = _time.perf_counter()
             return f"[offline] Ошибка обращения к LLM: {e}", int((t1 - t0) * 1000)
 
-    async def classify_json(self, prompt: str, max_tokens: int, json_schema: dict):
-        return await asyncio.to_thread(self._responses_json_sync, prompt, max_tokens, json_schema)
+    async def classify_json(self, prompt: str, max_tokens: int, json_schema: dict, shape: str = "string"):
+        return await asyncio.to_thread(self._responses_json_sync, prompt, max_tokens, json_schema, shape)
 
     def _classify_chat_sync(self, messages: List[Dict[str, str]], max_tokens: int, model: str):
         import time as _time
