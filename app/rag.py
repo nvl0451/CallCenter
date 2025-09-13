@@ -7,6 +7,8 @@ rag_available: bool = False
 rag_unavailable_reason: str | None = None
 
 # Initialize Chroma only if RAG enabled
+COLLECTION_NAME = "company_kb"
+
 if settings.enable_rag:
     try:
         import chromadb
@@ -14,7 +16,7 @@ if settings.enable_rag:
         CHROMA_DIR = pathlib.Path(settings.chroma_dir)
         CHROMA_DIR.mkdir(parents=True, exist_ok=True)
         client = chromadb.Client(ChromaSettings(is_persistent=True, persist_directory=str(CHROMA_DIR)))
-        collection = client.get_or_create_collection("company_kb")
+        collection = client.get_or_create_collection(COLLECTION_NAME)
         rag_available = True
     except Exception as e:
         rag_available = False
@@ -141,6 +143,22 @@ def delete_by_doc_id(doc_id: int) -> int:
         return 1
     except Exception:
         return 0
+
+def reset_index() -> None:
+    _require_available()
+    global collection
+    try:
+        # Drop and recreate the collection to ensure a clean slate
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        # ignore if doesn't exist
+        pass
+    # Recreate
+    collection = client.get_or_create_collection(COLLECTION_NAME)
+    try:
+        client.persist()
+    except Exception:
+        pass
 
 def chunk_count(text: str) -> int:
     chunks = _chunk_text(text or "", settings.rag_chunk_chars, settings.rag_chunk_overlap)

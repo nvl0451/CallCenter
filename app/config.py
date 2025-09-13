@@ -40,6 +40,7 @@ class Settings(BaseModel):
     rag_storage_dir: str = os.getenv("RAG_STORAGE_DIR", "./storage/rag")
     rag_hard_delete: bool = bool(int(os.getenv("RAG_HARD_DELETE", "0")))
     openai_mock: bool = bool(int(os.getenv("OPENAI_MOCK", "0")))
+    docs_dir: str = os.getenv("DOCS_DIR", "./docs")
     # Debug verbosity (hide noisy cls/llm debug by default)
     debug_verbose: bool = bool(int(os.getenv("DEBUG_VERBOSE", "0")))
     # Classifier fallback (OpenAI Chat) on persistent Responses failures

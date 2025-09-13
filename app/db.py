@@ -529,6 +529,98 @@ def set_doc_dirty(doc_id: int, dirty: int = 1) -> int:
     changed = cur.rowcount or 0
     conn.commit(); conn.close(); return changed
 
+def sync_seed_kb_from_files(base_dir: str = "data/kb") -> Dict[str, int]:
+    """Synchronize inline seed KB docs from filesystem into rag_documents.
+    For each file in base_dir, upsert a row with kind='inline' and source='seed-kb'.
+    Existing rows matched by title (filename) are updated if content hash differs.
+    Returns {inserted, updated}.
+    """
+    import pathlib as _pl
+    base = _pl.Path(base_dir)
+    out = {"inserted": 0, "updated": 0}
+    if not base.exists():
+        return out
+    conn = connect(); cur = conn.cursor()
+    for p in base.glob("*.*"):
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        fname = p.name
+        sha = _sha256_text(text)
+        b = len(text.encode("utf-8"))
+        cur.execute("SELECT id, sha256 FROM rag_documents WHERE title=? AND kind='inline'", (fname,))
+        row = cur.fetchone()
+        now = _now()
+        if row is None:
+            cur.execute(
+                """
+                INSERT INTO rag_documents (title, kind, rel_path, content_text, sha256, bytes, mime, source, active, created_at, updated_at, indexed_at, embed_model, chunks_count, dirty)
+                VALUES(?,?,?,?,?,?,?, ?,1, ?, ?, NULL, NULL, 0, 1)
+                """,
+                (fname, "inline", None, text, sha, b, "text/markdown", "seed-kb", now, now),
+            )
+            out["inserted"] += 1
+        else:
+            doc_id = int(row[0])
+            old_sha = str(row[1] or "")
+            if old_sha != sha:
+                cur.execute(
+                    "UPDATE rag_documents SET content_text=?, sha256=?, bytes=?, dirty=1, updated_at=? WHERE id=?",
+                    (text, sha, b, now, doc_id),
+                )
+                out["updated"] += 1
+    conn.commit(); conn.close();
+    return out
+
+def _sync_dir_inline(base_dir: str, source_tag: str = "docs") -> Dict[str, int]:
+    import pathlib as _pl
+    base = _pl.Path(base_dir)
+    out = {"inserted": 0, "updated": 0}
+    if not base.exists():
+        return out
+    conn = connect(); cur = conn.cursor()
+    for p in base.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in (".md", ".txt"):
+            continue
+        rel = str(p.relative_to(base))
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        sha = _sha256_text(text)
+        b = len(text.encode("utf-8"))
+        cur.execute("SELECT id, sha256 FROM rag_documents WHERE title=? AND kind='inline'", (rel,))
+        row = cur.fetchone()
+        now = _now()
+        if row is None:
+            cur.execute(
+                """
+                INSERT INTO rag_documents (title, kind, rel_path, content_text, sha256, bytes, mime, source, active, created_at, updated_at, indexed_at, embed_model, chunks_count, dirty)
+                VALUES(?,?,?,?,?,?,?, ?,1, ?, ?, NULL, NULL, 0, 1)
+                """,
+                (rel, "inline", None, text, sha, b, "text/markdown" if p.suffix.lower()==".md" else "text/plain", source_tag, now, now),
+            )
+            out["inserted"] += 1
+        else:
+            doc_id = int(row[0])
+            old_sha = str(row[1] or "")
+            if old_sha != sha:
+                cur.execute(
+                    "UPDATE rag_documents SET content_text=?, sha256=?, bytes=?, dirty=1, updated_at=?, source=? WHERE id=?",
+                    (text, sha, b, now, source_tag, doc_id),
+                )
+                out["updated"] += 1
+    conn.commit(); conn.close();
+    return out
+
+def sync_docs_dir(base_dir: str) -> Dict[str, int]:
+    return _sync_dir_inline(base_dir, source_tag="docs")
+
 
 def update_stems_bulk(stems_by_name: Dict[str, list]) -> int:
     """Update stems_json for given category names. Returns rows updated."""

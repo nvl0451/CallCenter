@@ -791,7 +791,8 @@ async def agent_message(req: AgentMessageRequest):
     docs = []
     if plan and plan_conf >= 0.65 and settings.enable_rag and rag_available and budget_ok():
         calls += 1; tools_used.append("rag_search")
-        q = f"Pricing details for {plan} plan"
+        ru = {"Basic":"Базовый","Plus":"Плюс","Business":"Бизнес"}.get(plan, plan)
+        q = f"Тариф {ru} (план {plan}) цена, ключевые функции, ограничения"
         try:
             docs = search(q, top_k=3)
         except Exception:
@@ -803,7 +804,7 @@ async def agent_message(req: AgentMessageRequest):
     # Confident plan path with RAG
     if plan and plan_conf >= 0.65 and docs:
         context = "\n\n".join([d.get("document", "")[:800] for d in docs])
-        sys = SYSTEM_BASE + "\nОтвечай кратко, используя только факты из [DOC]. Если чего‑то нет в документах — честно скажи."
+        sys = SYSTEM_BASE + "\nОтвечай как лаконичный менеджер по продажам. Формат: 1) Цена, 2) Ключевые функции (3-5 буллетов), 3) Следующий шаг. Без рассуждений и прелюдий. Используй только факты из [DOC]."
         messages = [
             {"role": "system", "content": sys},
             {"role": "user", "content": f"Пользователь хочет оформить план {plan}. На основе [DOC] опиши цену, ключевые функции и следующий шаг.\n\n[DOC]\n{context}"},
@@ -812,22 +813,72 @@ async def agent_message(req: AgentMessageRequest):
             reply, _, _ = await llm_client.chat(messages)
         except Exception:
             reply = f"План {plan}: см. детали в документации."
-        sources = [{"score": d.get("score"), "snippet": d.get("document", "")[:120]} for d in docs]
+        def _src_item(d: dict) -> dict:
+            md = d.get("metadata") or {}
+            return {
+                "score": d.get("score"),
+                "id": d.get("id"),
+                "source": md.get("source"),
+                "doc_id": md.get("doc_id"),
+                "snippet": d.get("document", "")[:200],
+            }
+        sources = [_src_item(d) for d in docs]
     else:
-        # Uncertain plan → negotiate: ask 2-3 quick questions then propose
-        sys = SYSTEM_BASE + (
-            "\nТы менеджер по продажам. Выясни за 2–3 вопроса, какой план подходит (Basic, Plus, Business),"
-            " затем предложи чёткий next step. Будь краток."
+        # Uncertain plan → LLM negotiator (strict, no fluff): exactly 2 questions + one next step line
+        sys = (
+            SYSTEM_BASE +
+            "\nТы уверенный менеджер по продажам. Пиши по‑делу, без преамбулы и рассуждений." \
+            "\nФормат ответа строго такой:" \
+            "\n1) Вопрос 1: <кратко>" \
+            "\n2) Вопрос 2: <кратко>" \
+            "\nСледующий шаг: <одна короткая фраза>."
+        )
+        user_msg = (
+            "Клиент не уверен в плане (Basic/Plus/Business). Задай ровно 2 лаконичных вопроса, "
+            "которые помогут выбрать план по числу пользователей, каналам (email/чат/WhatsApp) и требованиям (SSO/аналитика). "
+            "Затем предложи один следующий шаг. Текст клиента: " + text
         )
         messages = [
             {"role": "system", "content": sys},
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_msg},
         ]
         try:
             reply, _, _ = await llm_client.chat(messages)
         except Exception:
             reply = (
-                "Чтобы подобрать план, подскажите: сколько у вас пользователей, какие каналы нужны (email/чат/WhatsApp) и требуется ли SSO/аналитика?"
+                "1) Вопрос 1: Сколько будет пользователей?\n"
+                "2) Вопрос 2: Какие каналы нужны (email/чат/WhatsApp)? Нужны ли SSO/аналитика?\n"
+                "Следующий шаг: после ответа предложу подходящий план и ссылку на оформление."
             )
 
     return AgentMessageResponse(session_id=session_id, tools_used=tools_used, reply=reply or "", sources=sources)
+
+
+# ---------- Admin: KB reseed from files ----------
+@app.post("/admin/rag/sync_seed_kb")
+def admin_sync_seed_kb(req: Request):
+    _require_admin(req)
+    res = db.sync_seed_kb_from_files()
+    return res
+
+@app.post("/admin/rag/reset_index")
+def admin_reset_index(req: Request):
+    _require_admin(req)
+    if not (settings.enable_rag and rag_available):
+        raise HTTPException(503, "RAG unavailable")
+    rag_mod.reset_index()
+    return {"ok": True}
+
+@app.post("/admin/rag/sync_docs")
+def admin_sync_docs(req: Request, body: dict | None = None):
+    _require_admin(req)
+    base = None
+    try:
+        if body and isinstance(body, dict):
+            base = str(body.get("base") or "").strip() or None
+    except Exception:
+        base = None
+    if not base:
+        base = getattr(settings, "docs_dir", "./docs")
+    res = db.sync_docs_dir(base)
+    return {"synced": res, "base": base}
