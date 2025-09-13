@@ -57,6 +57,12 @@ def features():
             "multipart": mp,
             "backend": getattr(settings, "vision_backend", None),
         },
+        "tools": {
+            "enabled": True,
+            "max_calls": 3,
+            "tool_timeout_s": 8,
+            "total_budget_s": 20,
+        },
         "admin": {
             "caches": {
                 "classes": len(app_cache.classes_cache()),
@@ -733,3 +739,95 @@ def admin_reindex_dirty(req: Request, limit: int | None = None):
 def admin_mark_all_dirty(req: Request):
     _require_admin(req)
     return {"marked": db.mark_all_dirty()}
+
+
+# ---------- Agent ----------
+@app.post("/agent/message", response_model=AgentMessageResponse)
+async def agent_message(req: AgentMessageRequest):
+    import time as _t
+    t0 = _t.perf_counter()
+    tools_used: list[str] = []
+    max_calls = 3
+    calls = 0
+    session_id = req.session_id or str(uuid.uuid4())
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(400, "text required")
+
+    def budget_ok():
+        return calls < max_calls and ((_t.perf_counter() - t0) < 20.0)
+
+    # 1) Intent classification (reuse strict classifier): expect 'продажи' for purchase intent
+    intent = None
+    try:
+        if budget_ok():
+            calls += 1; tools_used.append("classify_text")
+            intent, _, _m = await _classify(text)
+    except HTTPException:
+        intent = None
+
+    # 2) If purchase intent, try to detect plan (Basic/Plus/Business)
+    plan = None; plan_conf = 0.0
+    if intent == "продажи" and budget_ok():
+        labels = ["Basic", "Plus", "Business"]
+        # Prefer SBERT-based quick classifier among labels
+        try:
+            from .local_classifier import classify_among as _cls_among
+            plan, plan_conf = _cls_among(text, [
+                "Basic plan", "Plus plan", "Business plan"
+            ])
+            plan = plan.split()[0]
+        except Exception:
+            # Heuristic fallback
+            low = text.lower()
+            if any(k in low for k in ["basic", "starter", "базов"]):
+                plan, plan_conf = "Basic", 0.6
+            elif any(k in low for k in ["plus", "плюс", "pro"]):
+                plan, plan_conf = "Plus", 0.6
+            elif any(k in low for k in ["business", "бизнес", "enterprise"]):
+                plan, plan_conf = "Business", 0.6
+
+    # 3) If confident plan, fetch KB snippet via RAG
+    docs = []
+    if plan and plan_conf >= 0.65 and settings.enable_rag and rag_available and budget_ok():
+        calls += 1; tools_used.append("rag_search")
+        q = f"Pricing details for {plan} plan"
+        try:
+            docs = search(q, top_k=3)
+        except Exception:
+            docs = []
+
+    # Build reply using LLM or templates
+    reply = ""
+    sources = None
+    # Confident plan path with RAG
+    if plan and plan_conf >= 0.65 and docs:
+        context = "\n\n".join([d.get("document", "")[:800] for d in docs])
+        sys = SYSTEM_BASE + "\nОтвечай кратко, используя только факты из [DOC]. Если чего‑то нет в документах — честно скажи."
+        messages = [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": f"Пользователь хочет оформить план {plan}. На основе [DOC] опиши цену, ключевые функции и следующий шаг.\n\n[DOC]\n{context}"},
+        ]
+        try:
+            reply, _, _ = await llm_client.chat(messages)
+        except Exception:
+            reply = f"План {plan}: см. детали в документации."
+        sources = [{"score": d.get("score"), "snippet": d.get("document", "")[:120]} for d in docs]
+    else:
+        # Uncertain plan → negotiate: ask 2-3 quick questions then propose
+        sys = SYSTEM_BASE + (
+            "\nТы менеджер по продажам. Выясни за 2–3 вопроса, какой план подходит (Basic, Plus, Business),"
+            " затем предложи чёткий next step. Будь краток."
+        )
+        messages = [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": text},
+        ]
+        try:
+            reply, _, _ = await llm_client.chat(messages)
+        except Exception:
+            reply = (
+                "Чтобы подобрать план, подскажите: сколько у вас пользователей, какие каналы нужны (email/чат/WhatsApp) и требуется ли SSO/аналитика?"
+            )
+
+    return AgentMessageResponse(session_id=session_id, tools_used=tools_used, reply=reply or "", sources=sources)

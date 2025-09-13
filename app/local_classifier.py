@@ -84,3 +84,17 @@ def classify(text: str) -> Tuple[str, float, Dict]:
     meta = {"backend": "sbert", "api_ms": wall_ms, "wall_ms": wall_ms}
     return name, conf, meta
 
+
+def classify_among(text: str, labels: List[str]) -> Tuple[str, float]:
+    """Classify arbitrary text among provided label strings using SBERT.
+    Returns (label, confidence[0..1]). Raises if model not available.
+    """
+    _ensure_model()
+    import numpy as _np  # type: ignore
+    q = _model.encode([text], normalize_embeddings=True)[0]
+    embs = _model.encode(labels, normalize_embeddings=True)
+    sims = embs @ q
+    idx = int(_np.argmax(sims))
+    sim = float(sims[idx])
+    conf = max(0.0, min(1.0, (sim + 1.0) / 2.0))
+    return labels[idx], conf

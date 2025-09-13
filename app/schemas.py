@@ -39,6 +39,17 @@ class VisionResponse(BaseModel):
     logits: List[float]
     labels: List[str]
 
+# -------- Agent Schemas --------
+class AgentMessageRequest(BaseModel):
+    session_id: Optional[str] = None
+    text: str
+
+class AgentMessageResponse(BaseModel):
+    session_id: str
+    tools_used: List[str]
+    reply: str
+    sources: Optional[List[dict]] = None
+
 # -------- Admin Schemas --------
 class AdminClassIn(BaseModel):
     name: str
