@@ -47,5 +47,9 @@ class Settings(BaseModel):
     classify_chat_model: str = os.getenv("CLASSIFY_CHAT_MODEL", "gpt-4o-mini")
     classify_use_responses: bool = bool(int(os.getenv("CLASSIFY_USE_RESPONSES", "1")))
     classify_deadline_ms: int = int(os.getenv("CLASSIFY_DEADLINE_MS", "1200"))
+    # Local classifier (SBERT) settings
+    classifier_backend: str = os.getenv("CLASSIFIER_BACKEND", "responses")  # responses | sbert
+    sbert_model: str = os.getenv("SBERT_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
+    sbert_device: str | None = os.getenv("SBERT_DEVICE", None)  # e.g., cpu or cuda
 
 settings = Settings()

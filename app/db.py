@@ -323,3 +323,42 @@ def mark_inline_indexed(embed_model: str):
     )
     conn.commit()
     conn.close()
+
+
+def update_stems_bulk(stems_by_name: Dict[str, list]) -> int:
+    """Update stems_json for given category names. Returns rows updated."""
+    if not stems_by_name:
+        return 0
+    import json as _json
+    conn = connect()
+    cur = conn.cursor()
+    updated = 0
+    for name, stems in stems_by_name.items():
+        try:
+            val = _json.dumps(stems or [], ensure_ascii=False)
+            cur.execute(
+                "UPDATE cls_categories SET stems_json=?, updated_at=strftime('%s','now') WHERE name=? AND active=1",
+                (val, name),
+            )
+            updated += cur.rowcount or 0
+        except Exception:
+            pass
+    conn.commit(); conn.close()
+    return updated
+
+
+def update_default_stems() -> int:
+    """Set improved stems for default 3 classes if they exist."""
+    stems = {
+        "техподдержка": [
+            "ошибк", "не запуска", "проблем", "что дела", "как исправ", "инструкц",
+            "шаг", "перезагруз", "переустанов", "очистк кеш", "не удаётс войт", "код ошиб", "лог"
+        ],
+        "продажи": [
+            "куп", "тариф", "цен", "оплат", "счёт", "подписк", "демо", "пробн"
+        ],
+        "жалоба": [
+            "жалоб", "вернут ден", "возврат", "списал дважд", "недоволен", "обман", "мошенн", "пожалова", "компенсац"
+        ],
+    }
+    return update_stems_bulk(stems)

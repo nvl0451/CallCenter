@@ -10,6 +10,7 @@ from .config import settings
 from .prompts import SYSTEM_BASE, CLASSIFY_PROMPT, PROMPTS_BY_TYPE
 from .memory import add_message, get_session_messages
 from .llm import llm_client
+from .local_classifier import classify as local_classify
 from .rag import rag_available, rag_unavailable_reason, ingest_texts, search
 from .vision import vision_available, vision_unavailable_reason, classify_image
 from . import db
@@ -43,6 +44,10 @@ def features():
         "use_responses": getattr(settings, "openai_use_responses", None),
         "reply_max_tokens": getattr(settings, "reply_max_tokens", None),
         "classify_max_tokens": getattr(settings, "classify_max_tokens", None),
+        "classifier": {
+            "backend": getattr(settings, "classifier_backend", "responses"),
+            "sbert_model": getattr(settings, "sbert_model", None) if getattr(settings, "classifier_backend", "responses") == "sbert" else None,
+        },
         "rag": {"enabled": settings.enable_rag, "available": rag_available, "reason": rag_unavailable_reason},
         "vision": {
             "enabled": settings.enable_vision,
@@ -104,6 +109,10 @@ async def _classify(text: str) -> tuple[str, float, dict]:
     if not settings.openai_api_key:
         cat, conf = _classify_heuristic(text)
         return cat, conf, {"mode": "offline", "wall_ms": 0, "api_ms": 0, "attempts": 0}
+    # Local SBERT classifier (fast, on-CPU) if configured
+    if getattr(settings, "classifier_backend", "responses") == "sbert":
+        cat, conf, meta = local_classify(text)
+        return cat, conf, meta
     # Иначе — строго Responses (gpt‑5) с компактным индекс‑JSON. Попытаться с двумя форматами input.
     names = app_cache.classes_names()
     labels = names if names else ["техподдержка", "продажи", "жалоба"]
@@ -305,6 +314,7 @@ async def send_message(req: MessageRequest):
 
     total_ms = int((_time.perf_counter() - req_t0) * 1000)
     latencies = {
+        "classify_backend": getattr(settings, "classifier_backend", "responses"),
         "classify_api_ms": int(cls_meta.get("api_ms", 0)),
         "classify_wall_ms": cls_wall_ms,
         "reply_api_ms": reply_api_ms,
@@ -467,3 +477,12 @@ def admin_bootstrap(req: Request):
         },
         "rag": {"ingested": rag_ingested, "enabled": settings.enable_rag, "available": rag_available},
     }
+
+
+@app.post("/admin/update_stems")
+def admin_update_stems(req: Request):
+    _require_admin(req)
+    from . import db as _db
+    updated = _db.update_default_stems()
+    app_cache.reload_caches()
+    return {"updated_rows": updated}
