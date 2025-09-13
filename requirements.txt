@@ -15,3 +15,4 @@ scikit-learn>=1.4
 # open-clip-torch>=2.24        # vision (requires torch)
 Pillow>=10.3                   # vision image handling
 python-multipart>=0.0.9        # file upload
+python-telegram-bot>=20.3      # telegram bot (optional)
