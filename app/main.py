@@ -815,12 +815,22 @@ async def agent_message(req: AgentMessageRequest):
             reply = f"План {plan}: см. детали в документации."
         def _src_item(d: dict) -> dict:
             md = d.get("metadata") or {}
+            doc = (d.get("document", "") or "").replace("\n", " ")
+            # collapse whitespace and cut to nearest word boundary around 200-240 chars
+            import re as _re
+            doc = _re.sub(r"\s+", " ", doc).strip()
+            snip = doc[:240]
+            if len(doc) > 240:
+                # try not to cut mid-word
+                cut = snip.rfind(" ")
+                if cut > 160:
+                    snip = snip[:cut] + "…"
             return {
                 "score": d.get("score"),
                 "id": d.get("id"),
                 "source": md.get("source"),
                 "doc_id": md.get("doc_id"),
-                "snippet": d.get("document", "")[:200],
+                "snippet": snip,
             }
         sources = [_src_item(d) for d in docs]
     else:

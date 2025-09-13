@@ -578,7 +578,7 @@ def sync_seed_kb_from_files(base_dir: str = "data/kb") -> Dict[str, int]:
 def _sync_dir_inline(base_dir: str, source_tag: str = "docs") -> Dict[str, int]:
     import pathlib as _pl
     base = _pl.Path(base_dir)
-    out = {"inserted": 0, "updated": 0}
+    out = {"inserted": 0, "updated": 0, "seen": 0}
     if not base.exists():
         return out
     conn = connect(); cur = conn.cursor()
@@ -592,9 +592,10 @@ def _sync_dir_inline(base_dir: str, source_tag: str = "docs") -> Dict[str, int]:
             text = p.read_text(encoding="utf-8")
         except Exception:
             continue
+        out["seen"] += 1
         sha = _sha256_text(text)
         b = len(text.encode("utf-8"))
-        cur.execute("SELECT id, sha256 FROM rag_documents WHERE title=? AND kind='inline'", (rel,))
+        cur.execute("SELECT id, sha256, source FROM rag_documents WHERE title=? AND kind='inline'", (rel,))
         row = cur.fetchone()
         now = _now()
         if row is None:
@@ -609,10 +610,18 @@ def _sync_dir_inline(base_dir: str, source_tag: str = "docs") -> Dict[str, int]:
         else:
             doc_id = int(row[0])
             old_sha = str(row[1] or "")
+            old_src = str(row[2] or "")
             if old_sha != sha:
                 cur.execute(
                     "UPDATE rag_documents SET content_text=?, sha256=?, bytes=?, dirty=1, updated_at=?, source=? WHERE id=?",
                     (text, sha, b, now, source_tag, doc_id),
+                )
+                out["updated"] += 1
+            elif old_src != source_tag:
+                # Update source tag even if content unchanged so queries reflect new origin
+                cur.execute(
+                    "UPDATE rag_documents SET source=?, updated_at=? WHERE id=?",
+                    (source_tag, now, doc_id),
                 )
                 out["updated"] += 1
     conn.commit(); conn.close();
