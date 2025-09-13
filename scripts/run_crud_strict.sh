@@ -7,6 +7,7 @@ set -euo pipefail
 
 BASE_URL=${BASE_URL:-"http://localhost:8000"}
 ADMIN_TOKEN=${ADMIN_TOKEN:-""}
+RAG_STORAGE_DIR=${RAG_STORAGE_DIR:-"./storage/rag"}
 
 red() { printf "\033[31m%s\033[0m\n" "$*"; }
 grn() { printf "\033[32m%s\033[0m\n" "$*"; }
@@ -135,8 +136,17 @@ printf '%s\n' "Тестовый файл Autotest." >"$tmpf"
 file_json=$(post_file /admin/rag/file "$tmpf" 1)
 file_id=$(echo "$file_json" | jq -r '.id')
 [ -n "$file_id" ] || die "File doc id missing"
+file_rel=$(echo "$file_json" | jq -r '.rel_path')
+[ -n "$file_rel" ] || die "File rel_path missing"
 echo "$file_json" | jq -e '.kind == "file" and (.rel_path|length) > 0 and .active == 1' >/dev/null || die "File doc invalid"
 ok "File doc uploaded id=$file_id"
+
+# Verify file exists on disk (best effort)
+if [ -f "${RAG_STORAGE_DIR}/${file_rel}" ]; then
+  ok "File present on disk: ${RAG_STORAGE_DIR}/${file_rel}"
+else
+  ylw "[STEP] Note: expected file not found at ${RAG_STORAGE_DIR}/${file_rel} (may be custom storage path)"
+fi
 
 sleep 0.3
 features_after_docs=$(get_json /features)
@@ -159,5 +169,17 @@ rag_list=$(get_json /admin/rag/docs)
 echo "$rag_list" | jq -e --argjson i "$inline_id" 'map(select(.id==$i and .active==0)) | length == 1' >/dev/null || die "Inline not inactive after delete"
 echo "$rag_list" | jq -e --argjson i "$file_id" 'map(select(.id==$i and .active==0)) | length == 1' >/dev/null || die "File not inactive after delete"
 ok "RAG docs soft-deleted"
+
+# Cleanup physical file if still present and API did not hard-delete
+if [ -n "${file_rel}" ]; then
+  if [ -f "${RAG_STORAGE_DIR}/${file_rel}" ]; then
+    rm -f "${RAG_STORAGE_DIR}/${file_rel}" || true
+    if [ -f "${RAG_STORAGE_DIR}/${file_rel}" ]; then
+      ylw "[STEP] Could not remove ${RAG_STORAGE_DIR}/${file_rel} (permissions?)."
+    else
+      ok "Cleaned up file ${RAG_STORAGE_DIR}/${file_rel}"
+    fi
+  fi
+fi
 
 ok "ALL CRUD TESTS PASSED"

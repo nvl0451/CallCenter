@@ -508,6 +508,27 @@ def get_rag_doc(doc_id: int) -> Dict | None:
     conn.close();
     return dict(row) if row else None
 
+def mark_all_dirty() -> int:
+    conn = connect(); cur = conn.cursor()
+    cur.execute("UPDATE rag_documents SET dirty=1, updated_at=strftime('%s','now') WHERE active=1")
+    changed = cur.rowcount or 0
+    conn.commit(); conn.close(); return changed
+
+def list_dirty_docs(limit: int | None = None) -> List[Dict]:
+    conn = connect(); cur = conn.cursor()
+    q = "SELECT * FROM rag_documents WHERE active=1 AND dirty=1 ORDER BY id ASC"
+    if isinstance(limit, int) and limit > 0:
+        q += f" LIMIT {int(limit)}"
+    cur.execute(q)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close(); return rows
+
+def set_doc_dirty(doc_id: int, dirty: int = 1) -> int:
+    conn = connect(); cur = conn.cursor()
+    cur.execute("UPDATE rag_documents SET dirty=?, updated_at=strftime('%s','now') WHERE id=?", (int(1 if dirty else 0), int(doc_id)))
+    changed = cur.rowcount or 0
+    conn.commit(); conn.close(); return changed
+
 
 def update_stems_bulk(stems_by_name: Dict[str, list]) -> int:
     """Update stems_json for given category names. Returns rows updated."""

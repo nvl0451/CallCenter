@@ -575,6 +575,20 @@ def admin_create_rag_inline(req: Request, body: AdminRagInlineIn):
     row = db.get_rag_doc(doc_id)
     return row  # type: ignore
 
+@app.put("/admin/rag/docs/{doc_id}", response_model=AdminRagDocOut)
+def admin_update_rag_inline(req: Request, doc_id: int, payload: dict):
+    _require_admin(req)
+    row = db.get_rag_doc(doc_id)
+    if not row:
+        raise HTTPException(404, "not found")
+    if row.get("kind") != "inline":
+        raise HTTPException(400, "only inline docs can be updated via this endpoint")
+    content = str(payload.get("content_text", ""))
+    if not content:
+        raise HTTPException(400, "content_text required")
+    db.update_rag_doc(doc_id, content_text=content, sha256=db._sha256_text(content), bytes=len(content.encode("utf-8")), dirty=1)
+    return db.get_rag_doc(doc_id)  # type: ignore
+
 # Multipart upload for .txt/.md
 try:
     from fastapi import UploadFile, File, Form
@@ -652,3 +666,70 @@ def admin_delete_rag_doc(req: Request, doc_id: int):
         except Exception:
             pass
     return {"deleted": changed}
+
+
+def _reindex_doc(doc: dict) -> dict:
+    if not (settings.enable_rag and rag_available):
+        raise HTTPException(503, "RAG unavailable")
+    import time as _t
+    t0 = _t.perf_counter()
+    content = None
+    if doc.get("kind") == "inline":
+        content = doc.get("content_text") or ""
+    else:
+        # file
+        rel = doc.get("rel_path") or ""
+        import os
+        try:
+            with open(os.path.join(settings.rag_storage_dir, rel), "rb") as f:
+                raw = f.read()
+            content = raw.decode("utf-8", errors="ignore")
+        except Exception as e:
+            raise HTTPException(500, f"failed to read file content: {e}")
+    # delete previous vectors
+    try:
+        rag_mod.delete_by_doc_id(doc.get("id"))
+    except Exception:
+        pass
+    # ingest again
+    chunks = 0
+    try:
+        meta = {"source": doc.get("source") or "admin", "doc_id": str(doc.get("id"))}
+        rag_mod.ingest_texts([content], metadatas=[meta])
+        chunks = rag_mod.chunk_count(content)
+    except Exception as e:
+        raise HTTPException(500, f"embed/ingest failed: {e}")
+    # update DB
+    try:
+        db.update_rag_doc(int(doc.get("id")), indexed_at=_time.time(), embed_model=rag_mod.get_embed_note(), chunks_count=chunks, dirty=0)
+    except Exception:
+        pass
+    ms = int((_t.perf_counter() - t0) * 1000)
+    return {"id": doc.get("id"), "chunks": chunks, "ms": ms, "ok": True}
+
+@app.post("/admin/rag/reindex/{doc_id}")
+def admin_reindex_one(req: Request, doc_id: int):
+    _require_admin(req)
+    row = db.get_rag_doc(doc_id)
+    if not row or int(row.get("active", 1)) != 1:
+        raise HTTPException(404, "doc not found or inactive")
+    return _reindex_doc(row)
+
+@app.post("/admin/rag/reindex_dirty")
+def admin_reindex_dirty(req: Request, limit: int | None = None):
+    _require_admin(req)
+    rows = db.list_dirty_docs(limit=limit)
+    out = []
+    errs = 0
+    for r in rows:
+        try:
+            out.append(_reindex_doc(r))
+        except Exception as e:
+            errs += 1
+            out.append({"id": r.get("id"), "ok": False, "error": str(e)})
+    return {"processed": len(rows), "errors": errs, "results": out}
+
+@app.post("/admin/rag/mark_all_dirty")
+def admin_mark_all_dirty(req: Request):
+    _require_admin(req)
+    return {"marked": db.mark_all_dirty()}

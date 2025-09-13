@@ -31,64 +31,91 @@ else:
     else:
         vision_unavailable_reason = "OpenAI or CLIP backend unavailable"
 
-CATEGORIES = [
-    "ошибка интерфейса",
-    "проблема с оплатой",
-    "технический сбой",
-    "вопрос по продукту",
-    "другое",
-]
-
-# Enrich CLIP text prompts with multilingual templates and synonyms to improve recall
-_CLIP_TEMPLATES = [
-    "скриншот: {s}",
-    "интерфейс: {s}",
-    "сообщение: {s}",
-    "предупреждение: {s}",
-    "ошибка: {s}",
-    "a screenshot of {s}",
-    "ui: {s}",
-    "dialog: {s}",
-    "notice: {s}",
-]
-
-_CLIP_SYNONYMS = {
-    "ошибка интерфейса": [
+def _labels_from_cache():
+    try:
+        from . import cache as app_cache
+        rows = app_cache.vision_labels_cache()
+    except Exception:
+        rows = []
+    if rows:
+        import json as _json
+        names = []
+        syn_map = {}
+        tpl_map = {}
+        for r in rows:
+            name = str(r.get("name", "")).strip()
+            if not name:
+                continue
+            names.append(name)
+            try:
+                syns = _json.loads(r.get("synonyms_json") or "[]")
+            except Exception:
+                syns = []
+            try:
+                tpls = _json.loads(r.get("templates_json") or "[]")
+            except Exception:
+                tpls = []
+            syn_map[name] = [s for s in syns if isinstance(s, str) and s.strip()] or [name]
+            tpl_map[name] = [t for t in tpls if isinstance(t, str) and t.strip()]
+        if names:
+            return names, syn_map, tpl_map
+    # Fallback defaults
+    names = [
         "ошибка интерфейса",
-        "сообщение об ошибке",
-        "окно ошибки",
-        "предупреждение интерфейса",
-        "interface error",
-        "ui error",
-        "error dialog",
-        "warning dialog",
-    ],
-    "проблема с оплатой": [
         "проблема с оплатой",
-        "ошибка оплаты",
-        "payment error",
-        "billing problem",
-        "declined card",
-    ],
-    "технический сбой": [
         "технический сбой",
-        "server error",
-        "internal error",
-        "crash",
-        "stack trace",
-    ],
-    "вопрос по продукту": [
         "вопрос по продукту",
-        "product question",
-        "how to use",
-        "help screen",
-    ],
-    "другое": [
         "другое",
-        "other",
-        "misc",
-    ],
-}
+    ]
+    tpl = [
+        "скриншот: {s}",
+        "интерфейс: {s}",
+        "сообщение: {s}",
+        "предупреждение: {s}",
+        "ошибка: {s}",
+        "a screenshot of {s}",
+        "ui: {s}",
+        "dialog: {s}",
+        "notice: {s}",
+    ]
+    syn = {
+        "ошибка интерфейса": [
+            "ошибка интерфейса",
+            "сообщение об ошибке",
+            "окно ошибки",
+            "предупреждение интерфейса",
+            "interface error",
+            "ui error",
+            "error dialog",
+            "warning dialog",
+        ],
+        "проблема с оплатой": [
+            "проблема с оплатой",
+            "ошибка оплаты",
+            "payment error",
+            "billing problem",
+            "declined card",
+        ],
+        "технический сбой": [
+            "технический сбой",
+            "server error",
+            "internal error",
+            "crash",
+            "stack trace",
+        ],
+        "вопрос по продукту": [
+            "вопрос по продукту",
+            "product question",
+            "how to use",
+            "help screen",
+        ],
+        "другое": [
+            "другое",
+            "other",
+            "misc",
+        ],
+    }
+    return names, syn, {name: tpl for name in names}
 
 def _load_clip():
     global _model, _preprocess, _tokenizer
@@ -116,7 +143,7 @@ def _classify_openai(img: "Image.Image") -> Tuple[str, float, List[float], List[
     buf = BytesIO()
     img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    categories = CATEGORIES
+    categories, _, _ = _labels_from_cache()
     instruction = (
         "Классифицируй изображение в одну категорию из списка и верни JSON: "
         "{\"category\":\"<категория>\",\"confidence\":<0..1>} "
@@ -176,11 +203,13 @@ def classify_image(img: "Image.Image") -> Tuple[str, float, List[float], List[st
             image_features = _model.encode_image(image)
             image_features /= image_features.norm(dim=-1, keepdim=True)
 
+            labels, syn_map, tpl_map = _labels_from_cache()
             class_feats = []
-            for label in CATEGORIES:
+            for label in labels:
                 phrases: List[str] = []
-                for syn in _CLIP_SYNONYMS.get(label, [label]):
-                    for tpl in _CLIP_TEMPLATES:
+                tpls = tpl_map.get(label) or ["скриншот: {s}"]
+                for syn in syn_map.get(label, [label]):
+                    for tpl in tpls:
                         phrases.append(tpl.format(s=syn, label=label))
                 toks = _tokenizer(phrases)
                 tf = _model.encode_text(toks)
@@ -191,5 +220,5 @@ def classify_image(img: "Image.Image") -> Tuple[str, float, List[float], List[st
             text_features = torch.cat(class_feats, dim=0)
             logits = (100.0 * image_features @ text_features.T).softmax(dim=-1).squeeze(0)
         conf, idx = float(logits.max().item()), int(logits.argmax().item())
-        return CATEGORIES[idx], conf, [float(x) for x in logits.tolist()], CATEGORIES
+        return labels[idx], conf, [float(x) for x in logits.tolist()], labels
     raise RuntimeError(vision_unavailable_reason or "Vision unavailable")
