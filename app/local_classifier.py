@@ -98,3 +98,13 @@ def classify_among(text: str, labels: List[str]) -> Tuple[str, float]:
     sim = float(sims[idx])
     conf = max(0.0, min(1.0, (sim + 1.0) / 2.0))
     return labels[idx], conf
+
+def warm() -> bool:
+    """Preload model and label embeddings; return True if warmed."""
+    try:
+        _ensure_model()
+        # also prebuild label embeddings if categories present
+        _refresh_labels_if_needed()
+        return True
+    except Exception:
+        return False

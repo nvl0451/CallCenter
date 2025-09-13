@@ -49,6 +49,8 @@ class AgentMessageResponse(BaseModel):
     tools_used: List[str]
     reply: str
     sources: Optional[List[dict]] = None
+    latencies: Optional[dict] = None
+    llm_fallback: bool = False
 
 # -------- Admin Schemas --------
 class AdminClassIn(BaseModel):

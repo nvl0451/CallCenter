@@ -431,6 +431,13 @@ def _startup():
         app_cache.reload_caches()
     except Exception:
         pass
+    # Warm SBERT classifier to avoid first-use latency
+    try:
+        if getattr(settings, "classifier_backend", "responses") == "sbert":
+            from . import local_classifier as _lc
+            _lc.warm()
+    except Exception:
+        pass
     # Optional initial RAG ingest for seeded inline docs
     try:
         if settings.enable_rag and rag_available and inserted and inserted.get("rag_docs", 0) > 0:
@@ -789,30 +796,75 @@ async def agent_message(req: AgentMessageRequest):
 
     # 3) If confident plan, fetch KB snippet via RAG
     docs = []
+    rag_ms = 0
     if plan and plan_conf >= 0.65 and settings.enable_rag and rag_available and budget_ok():
         calls += 1; tools_used.append("rag_search")
         ru = {"Basic":"Базовый","Plus":"Плюс","Business":"Бизнес"}.get(plan, plan)
         q = f"Тариф {ru} (план {plan}) цена, ключевые функции, ограничения"
         try:
-            docs = search(q, top_k=3)
+            _rt0 = _t.perf_counter()
+            docs = search(q, top_k=5)
+            rag_ms = int((_t.perf_counter() - _rt0) * 1000)
         except Exception:
             docs = []
 
     # Build reply using LLM or templates
     reply = ""
     sources = None
+    llm_fallback = False
+    llm_ms = 0
+
+    def _extract_plan_section(txt: str, plan_en: str, plan_ru: str) -> str:
+        import re as _re
+        t = txt or ""
+        # Try headings like ## Плюс (Plus) or ## Plus
+        patterns = [
+            rf"^##\s*{plan_ru}.*$[\s\S]*?(?=^##\s|\Z)",
+            rf"^##\s*{plan_en}.*$[\s\S]*?(?=^##\s|\Z)",
+        ]
+        for pat in patterns:
+            m = _re.search(pat, t, flags=_re.MULTILINE)
+            if m:
+                return m.group(0)
+        return t
     # Confident plan path with RAG
     if plan and plan_conf >= 0.65 and docs:
-        context = "\n\n".join([d.get("document", "")[:800] for d in docs])
-        sys = SYSTEM_BASE + "\nОтвечай как лаконичный менеджер по продажам. Формат: 1) Цена, 2) Ключевые функции (3-5 буллетов), 3) Следующий шаг. Без рассуждений и прелюдий. Используй только факты из [DOC]."
+        ru = {"Basic":"Базовый","Plus":"Плюс","Business":"Бизнес"}.get(plan, plan)
+        import re as _re
+        sections = []
+        for d in docs:
+            raw = d.get("document", "") or ""
+            sec = _extract_plan_section(raw, plan, ru)
+            # Remove generic inheritance lines to avoid "всё из Базового" phrasing in LLM output
+            sec_lines = [ln for ln in sec.splitlines() if not _re.search(r"(?i)(вс.? из базов|everything in basic)", ln)]
+            sec_clean = "\n".join(sec_lines)
+            sections.append(sec_clean[:1500])
+        context = "\n\n".join(sections)
+        included_hint = {
+            "Basic": "(до 3 пользователей включено)",
+            "Plus": "(до 10 пользователей включено)",
+            "Business": "(до 25 пользователей включено)",
+        }.get(plan, "")
+        sys = SYSTEM_BASE + (
+            "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Пиши по‑русски, живым человеческим языком (без канцеляризмов и англицизмов)." \
+            "\nФормат ответа:" \
+            "\n— Короткий приветствующий лид из 1 фразы (без общих рассуждений)." \
+            "\n— Цена: 1 короткая фраза." \
+            "\n— Ключевые выгоды плана: 3–5 маркеров «— …» только про этот план (не упоминай другие планы и не пиши ‘всё из Базового’)." \
+            "\n— Заверши дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’). Мягко предложи выбрать период оплаты (месяц/год; за год — скидка 20%) и попроси e‑mail администратора для приглашения команды " + included_hint + ". Пиши просто и по‑человечески." \
+            "\nИспользуй только факты из [DOC]."
+        )
         messages = [
             {"role": "system", "content": sys},
-            {"role": "user", "content": f"Пользователь хочет оформить план {plan}. На основе [DOC] опиши цену, ключевые функции и следующий шаг.\n\n[DOC]\n{context}"},
+            {"role": "user", "content": f"Пользователь хочет оформить план {plan}. На основе [DOC] опиши цену, ключевые выгоды и мягко предложи, что сделать дальше (без слов ‘Следующий шаг’).\n\n[DOC]\n{context}"},
         ]
         try:
+            _lt0 = _t.perf_counter()
             reply, _, _ = await llm_client.chat(messages)
+            llm_ms = int((_t.perf_counter() - _lt0) * 1000)
         except Exception:
             reply = f"План {plan}: см. детали в документации."
+            llm_fallback = True
         def _src_item(d: dict) -> dict:
             md = d.get("metadata") or {}
             doc = (d.get("document", "") or "").replace("\n", " ")
@@ -834,14 +886,14 @@ async def agent_message(req: AgentMessageRequest):
             }
         sources = [_src_item(d) for d in docs]
     else:
-        # Uncertain plan → LLM negotiator (strict, no fluff): exactly 2 questions + one next step line
+        # Uncertain plan → LLM negotiator (strict ru-only): exactly 2 questions + one next step line
         sys = (
             SYSTEM_BASE +
-            "\nТы уверенный менеджер по продажам. Пиши по‑делу, без преамбулы и рассуждений." \
-            "\nФормат ответа строго такой:" \
-            "\n1) Вопрос 1: <кратко>" \
-            "\n2) Вопрос 2: <кратко>" \
-            "\nСледующий шаг: <одна короткая фраза>."
+            "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Только по‑русски, без эмодзи и иностранных символов." \
+            "\nФормат ответа:" \
+            "\n— Короткая приветственная фраза (1 строка)." \
+            "\n— Два уточняющих вопроса (каждый с маркером «— …», очень коротко)." \
+            "\n— Заверши 1 дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’), например: ‘Ответьте — подберу план и пришлю ссылку на оплату/счёт сегодня’."
         )
         user_msg = (
             "Клиент не уверен в плане (Basic/Plus/Business). Задай ровно 2 лаконичных вопроса, "
@@ -853,15 +905,19 @@ async def agent_message(req: AgentMessageRequest):
             {"role": "user", "content": user_msg},
         ]
         try:
+            _lt0 = _t.perf_counter()
             reply, _, _ = await llm_client.chat(messages)
+            llm_ms = int((_t.perf_counter() - _lt0) * 1000)
         except Exception:
             reply = (
                 "1) Вопрос 1: Сколько будет пользователей?\n"
                 "2) Вопрос 2: Какие каналы нужны (email/чат/WhatsApp)? Нужны ли SSO/аналитика?\n"
                 "Следующий шаг: после ответа предложу подходящий план и ссылку на оформление."
             )
+            llm_fallback = True
 
-    return AgentMessageResponse(session_id=session_id, tools_used=tools_used, reply=reply or "", sources=sources)
+    lat = {"rag_ms": rag_ms, "llm_ms": llm_ms, "total_ms": int((_t.perf_counter() - t0) * 1000)}
+    return AgentMessageResponse(session_id=session_id, tools_used=tools_used, reply=reply or "", sources=sources, latencies=lat, llm_fallback=llm_fallback)
 
 
 # ---------- Admin: KB reseed from files ----------
