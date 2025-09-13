@@ -1,55 +1,51 @@
-# CallCenter LLM + RAG + Vision
+# CallCenter LLM + RAG + Vision (OpenAI)
+
+FastAPI‑сервис с диалогом, RAG и классификацией изображений. По умолчанию — OpenAI.
 
 ## Быстрый старт
-1. Python 3.10+
-2. `python -m venv .venv && source .venv/bin/activate`
-3. `pip install -r requirements.txt`
-4. Создайте `.env` из `.env.example` и пропишите `OPENAI_API_KEY` (и при необходимости `OPENAI_MODEL`)
-5. `bash run.sh` (скрипт автоматически активирует `.venv`)
+1) Окружение
+- `python -m venv .venv && source .venv/bin/activate`
+2) Зависимости
+- `pip install -U pip setuptools wheel`
+- `pip install -r requirements.txt`
+3) Настройка `.env`
+- `cp .env.example .env` и укажите `OPENAI_API_KEY`
+- (при необходимости) `OPENAI_MODEL`, `OPENAI_USE_RESPONSES`, `REPLY_MAX_TOKENS`, `CLASSIFY_MAX_TOKENS`
+- Для RAG: `ENABLE_RAG=1`, `RAG_USE_OPENAI_EMBEDDINGS=1`
+- Для Vision: `ENABLE_VISION=1`, `VISION_BACKEND=openai` (или `clip` при наличии torch)
+4) Запуск
+- `bash run.sh`
 
-### Частичный запуск (только диалог/классификация)
-- По умолчанию RAG и Vision отключены, чтобы не требовать heavy-зависимости.
-- Включение фич:
-  - `ENABLE_RAG=1` — включает ChromaDB + sentence-transformers
-  - `ENABLE_VISION=1` — включает CLIP (torch + open-clip)
-
-Пример `.env` для минимального запуска:
-```
-OPENAI_API_KEY=sk-your-openai-key
-ENABLE_RAG=0
-ENABLE_VISION=0
-```
+Проверка: `curl -s http://localhost:8000/health` → `{ "ok": true }`
 
 ## Примеры запросов
-### Диалог
-```bash
-curl -sX POST http://localhost:8000/dialog/start -H 'Content-Type: application/json' -d '{}'
-# => {"session_id":"..."}
+- Диалог
+  - `SESSION=$(curl -sX POST http://localhost:8000/dialog/start -H 'Content-Type: application/json' -d '{}' | jq -r .session_id)`
+  - `curl -sX POST http://localhost:8000/dialog/message -H 'Content-Type: application/json' -d "$(jq -n --arg s "$SESSION" --arg m 'у меня списали деньги дважды' '{session_id:$s, message:$m}')"`
 
-curl -sX POST http://localhost:8000/dialog/message -H 'Content-Type: application/json' \
-  -d '{"session_id":"<ID>", "message":"у меня списали деньги дважды"}'
-```
+- RAG
+  - `curl -sX POST http://localhost:8000/rag/ingest -H 'Content-Type: application/json' -d '{}'`
+  - `curl -sX POST http://localhost:8000/rag/ask -H 'Content-Type: application/json' -d '{"question":"какая политика возврата?","top_k":4}'`
 
-### RAG
-```bash
-curl -sX POST http://localhost:8000/rag/ingest -H 'Content-Type: application/json' -d '{}' # требует ENABLE_RAG=1
+- Vision
+  - `curl -s -F 'file=@/abs/path/image.png' http://localhost:8000/vision/classify`
 
-curl -sX POST http://localhost:8000/rag/ask -H 'Content-Type: application/json' \
-  -d '{"question":"какая политика возврата?"}'
-```
+- Самодиагностика
+  - `curl -s http://localhost:8000/features | jq`
 
-### Vision
-```bash
-curl -s -F 'file=@screenshot.png' http://localhost:8000/vision/classify # требует ENABLE_VISION=1
-```
+## Параметры
+- `OPENAI_API_KEY` — ключ OpenAI
+- `OPENAI_MODEL` — чат‑модель (дефолт `gpt-5-mini`)
+- `OPENAI_USE_RESPONSES` — 1 для Responses (gpt‑5), 0 для Chat
+- `REPLY_MAX_TOKENS` — лимит токенов ответа (дефолт 256)
+- `CLASSIFY_MAX_TOKENS` — лимит для классификатора (дефолт 16)
+- RAG: `ENABLE_RAG`, `RAG_USE_OPENAI_EMBEDDINGS`, `OPENAI_EMBED_MODEL`, `RAG_CHUNK_CHARS`, `RAG_CHUNK_OVERLAP`
+- Vision: `ENABLE_VISION`, `VISION_BACKEND=openai|clip`, `OPENAI_VISION_MODEL`, `VISION_ALLOW_INSECURE_DOWNLOAD`
 
-Если видите ошибку про `python-multipart`, убедитесь, что пакет установлен в том же интерпретаторе, который запускает uvicorn. Скрипт `run.sh` использует `.venv/bin/uvicorn`, если виртуальное окружение существует.
+## Примечания
+- gpt‑5 использует Responses API с reasoning `minimal` (fallback `low`). Для самой низкой задержки используйте быстрые Chat‑модели (например, `gpt-4o-mini`) и `OPENAI_USE_RESPONSES=0`.
+- Для локального CLIP потребуется установить `torch`, `torchvision`, `open-clip-torch`; на первом запуске скачаются веса.
 
-## Заметки по стоимости/скорости
-- Температура = 0.2; max_tokens = 512 — дешёвая, быстрая генерация.
-- Классификация — короткий вызов LLM с `max_tokens=16`, `temperature=0.0`, возвращает JSON `{category, confidence}`.
-- Можно включить агрессивное триммирование истории (см. `history[-8:]`).
-
-## Метрики/логи
-- В ответах диалога возвращается приблизительная оценка стоимости и latency.
-- Для продакшена подключите Prometheus/OTel.
+## Отладка
+- Если POST /vision/classify молчит, убедитесь в корректности пути к файлу и используйте `-vS`.
+- Состояние фич: `/features`.

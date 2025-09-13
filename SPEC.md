@@ -46,18 +46,18 @@ uvicorn[standard]>=0.30
 httpx>=0.27
 pydantic>=2.7
 python-dotenv>=1.0
+openai>=1.51.0
 chromadb>=0.5.5
-sentence-transformers>=3.0
-numpy>=1.26
+numpy<2,>=1.26.4
 pandas>=2.2
 scikit-learn>=1.4
-# Torch stack (CPU)
-torch>=2.3; platform_system!="Darwin" or platform_machine!="arm64"
-torchvision>=0.18; platform_system!="Darwin" or platform_machine!="arm64"
-# macOS arm64 users: установите torch вручную по инструкции PyTorch
 Pillow>=10.3
-open-clip-torch>=2.24.0
 python-multipart>=0.0.9
+# Опционально (для локального CLIP или SBERT):
+# sentence-transformers>=3.0
+# torch==2.2.*
+# torchvision==0.17.*
+# open-clip-torch>=2.24.0
 ```
 
 ---
@@ -82,6 +82,19 @@ LLM_TEMPERATURE=0.2
 # Лимиты на токены (ответ / классификация)
 REPLY_MAX_TOKENS=256
 CLASSIFY_MAX_TOKENS=16
+ 
+# RAG
+ENABLE_RAG=1
+RAG_USE_OPENAI_EMBEDDINGS=1
+OPENAI_EMBED_MODEL=text-embedding-3-small
+RAG_CHUNK_CHARS=800
+RAG_CHUNK_OVERLAP=120
+
+# Vision
+ENABLE_VISION=1
+VISION_BACKEND=openai   # openai | clip
+OPENAI_VISION_MODEL=gpt-4o-mini
+VISION_ALLOW_INSECURE_DOWNLOAD=0
 ```
 
 ---
@@ -108,6 +121,7 @@ class Settings(BaseModel):
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5-mini")
     openai_use_responses: bool = bool(int(os.getenv("OPENAI_USE_RESPONSES", "1")))
+    openai_embed_model: str = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 
     sqlite_path: str = os.getenv("SQLITE_PATH", "./callcenter.sqlite3")
     chroma_dir: str = os.getenv("CHROMA_DIR", "./chroma_db")
@@ -115,6 +129,20 @@ class Settings(BaseModel):
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     reply_max_tokens: int = int(os.getenv("REPLY_MAX_TOKENS", "256"))
     classify_max_tokens: int = int(os.getenv("CLASSIFY_MAX_TOKENS", "16"))
+
+    # Feature flags
+    enable_rag: bool = bool(int(os.getenv("ENABLE_RAG", "1")))
+    enable_vision: bool = bool(int(os.getenv("ENABLE_VISION", "1")))
+
+    # RAG controls
+    rag_use_openai_embeddings: bool = bool(int(os.getenv("RAG_USE_OPENAI_EMBEDDINGS", "1")))
+    rag_chunk_chars: int = int(os.getenv("RAG_CHUNK_CHARS", "800"))
+    rag_chunk_overlap: int = int(os.getenv("RAG_CHUNK_OVERLAP", "120"))
+
+    # Vision
+    openai_vision_model: str = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
+    vision_backend: str = os.getenv("VISION_BACKEND", "openai")
+    vision_allow_insecure_download: bool = bool(int(os.getenv("VISION_ALLOW_INSECURE_DOWNLOAD", "0")))
 
 settings = Settings()
 ```
@@ -140,6 +168,7 @@ class MessageRequest(BaseModel):
 
 class MessageResponse(BaseModel):
     type: str
+    confidence: float
     reply: str
     cost_estimate_usd: float
     latency_ms: int
@@ -169,12 +198,14 @@ class VisionResponse(BaseModel):
 ```python
 SYSTEM_BASE = (
     "Ты — вежливый и точный LLM‑агент колл‑центра. Говори кратко, дружелюбно, по делу. "
+    "Не показывай ход мыслей и рассуждения; давай готовый ответ. "
     "Если нужна уточняющая информация — задай 1-2 конкретных вопроса."
 )
 
 CLASSIFY_PROMPT = (
     "Классифицируй пользовательский запрос в одну категорию из: "
-    "[техподдержка, продажи, жалоба]. Верни только одно слово из списка.\n\nЗапрос: {text}"
+    "[техподдержка, продажи, жалоба]. Верни строгий JSON без пояснений: "
+    "{\\\"category\\\":\\\"<категория>\\\",\\\"confidence\\\":<0..1>}.\n\nЗапрос: {text}"
 )
 
 PROMPTS_BY_TYPE = {
@@ -284,40 +315,48 @@ llm_client = LLMClient()
 
 ---
 
-## 🔎 app/rag.py (ChromaDB + sentence‑transformers)
+## 🔎 app/rag.py (ChromaDB + OpenAI/SBERT эмбеддинги)
 ```python
 from __future__ import annotations
-import os, uuid, pathlib
+import uuid, pathlib
 from typing import List, Dict
 import chromadb
 from chromadb.config import Settings as ChromaSettings
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 from .config import settings
 
 CHROMA_DIR = pathlib.Path(settings.chroma_dir)
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-
 client = chromadb.Client(ChromaSettings(is_persistent=True, persist_directory=str(CHROMA_DIR)))
 collection = client.get_or_create_collection("company_kb")
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    return embedder.encode(texts, normalize_embeddings=True).tolist()
+    if settings.rag_use_openai_embeddings and settings.openai_api_key:
+        oai = OpenAI(api_key=settings.openai_api_key)
+        resp = oai.embeddings.create(model=settings.openai_embed_model, input=texts)
+        return [e.embedding for e in resp.data]
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    return model.encode(texts, normalize_embeddings=True).tolist()
 
 def ingest_texts(texts: List[str], metadatas: List[Dict] | None = None):
     ids = [str(uuid.uuid4()) for _ in texts]
     embs = embed_texts(texts)
     collection.add(ids=ids, embeddings=embs, documents=texts, metadatas=metadatas)
-    client.persist()
+    try:
+        client.persist()
+    except Exception:
+        pass
     return ids
 
 def search(query: str, top_k: int = 4):
     q_emb = embed_texts([query])[0]
-    res = collection.query(query_embeddings=[q_emb], n_results=top_k, include=["documents", "metadatas", "distances", "ids"])
+    res = collection.query(query_embeddings=[q_emb], n_results=top_k, include=["documents", "metadatas", "distances"])
     items = []
-    for i in range(len(res["ids"][0])):
+    n = len(res.get("documents", [[]])[0])
+    for i in range(n):
         items.append({
-            "id": res["ids"][0][i],
+            "id": res.get("ids", [[None]])[0][i] if res.get("ids") else None,
             "document": res["documents"][0][i],
             "metadata": res.get("metadatas", [[{}]])[0][i] or {},
             "score": float(1.0 - (res.get("distances", [[1.0]])[0][i] or 1.0)),
@@ -327,49 +366,13 @@ def search(query: str, top_k: int = 4):
 
 ---
 
-## 🖼️ app/vision.py (Zero‑shot CLIP классификация)
+## 🖼️ app/vision.py (OpenAI или локальный CLIP)
 ```python
-from __future__ import annotations
-from typing import List, Tuple
-from PIL import Image
-import torch
-import open_clip
-
-CATEGORIES = [
-    "ошибка интерфейса",
-    "проблема с оплатой",
-    "технический сбой",
-    "вопрос по продукту",
-    "другое",
-]
-
-_model = None
-_preprocess = None
-_tokenizer = None
-
-def _load():
-    global _model, _preprocess, _tokenizer
-    if _model is None:
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            model_name="ViT-B-32", pretrained="openai"
-        )
-        tokenizer = open_clip.get_tokenizer("ViT-B-32")
-        model.eval()
-        _model, _preprocess, _tokenizer = model, preprocess, tokenizer
-
-@torch.inference_mode()
-def classify_image(img: Image.Image) -> Tuple[str, float, List[float], List[str]]:
-    _load()
-    image = _preprocess(img).unsqueeze(0)
-    texts = _tokenizer([f"фото: {c}" for c in CATEGORIES])
-    with torch.no_grad():
-        image_features = _model.encode_image(image)
-        text_features = _model.encode_text(texts)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
-        text_features /= text_features.norm(dim=-1, keepdim=True)
-        logits = (100.0 * image_features @ text_features.T).softmax(dim=-1).squeeze(0)
-    conf, idx = float(logits.max().item()), int(logits.argmax().item())
-    return CATEGORIES[idx], conf, [float(x) for x in logits.tolist()], CATEGORIES
+# Два варианта:
+# 1) VISION_BACKEND=openai — отправляем изображение в OpenAI (Chat/Responses),
+#    модель задаётся OPENAI_VISION_MODEL (по умолчанию gpt-4o-mini). torch не требуется.
+# 2) VISION_BACKEND=clip — локальный zero‑shot через open‑clip‑torch (ViT‑B/32 по умолчанию).
+#    Используются мультиязычные шаблоны и синонимы для повышения качества классификации UI‑скриншотов.
 ```
 
 ---
