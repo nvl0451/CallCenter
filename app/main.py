@@ -15,6 +15,7 @@ from .rag import rag_available, rag_unavailable_reason, ingest_texts, search
 from .vision import vision_available, vision_unavailable_reason, classify_image
 from . import db
 from . import cache as app_cache
+from . import sales
 from . import rag as rag_mod
 
 app = FastAPI(title="CallCenter LLM + RAG + Vision")
@@ -760,6 +761,19 @@ async def agent_message(req: AgentMessageRequest):
     text = req.text.strip()
     if not text:
         raise HTTPException(400, "text required")
+    # Sales session state and opportunistic slot extraction
+    st = sales.get(session_id)
+    try:
+        slot_guess = sales.parse_message_slots(text)
+        if slot_guess:
+            sales.update(session_id, **slot_guess)
+    except Exception:
+        pass
+    # Persist user message for conversational context
+    try:
+        add_message(session_id, "user", text)
+    except Exception:
+        pass
 
     def budget_ok():
         return calls < max_calls and ((_t.perf_counter() - t0) < 20.0)
@@ -772,6 +786,8 @@ async def agent_message(req: AgentMessageRequest):
             intent, _, _m = await _classify(text)
     except HTTPException:
         intent = None
+    if intent:
+        sales.update(session_id, intent=intent)
 
     # 2) If purchase intent, try to detect plan (Basic/Plus/Business)
     plan = None; plan_conf = 0.0
@@ -794,6 +810,18 @@ async def agent_message(req: AgentMessageRequest):
             elif any(k in low for k in ["business", "бизнес", "enterprise"]):
                 plan, plan_conf = "Business", 0.6
 
+    if plan:
+        sales.update(session_id, plan_candidate=plan, plan_confidence=plan_conf)
+    # If unsure but we have some slots, recommend a plan heuristically
+    try:
+        st_now = sales.get(session_id)
+        if (not plan or plan_conf < 0.65) and intent == "продажи":
+            rec = sales.recommend_plan(st_now.get("seats"), st_now.get("channels") or [], st_now.get("sso_required"), st_now.get("analytics_required"))
+            plan = rec; plan_conf = max(plan_conf, 0.7)
+            sales.update(session_id, plan_candidate=plan, plan_confidence=plan_conf)
+    except Exception:
+        pass
+
     # 3) If confident plan, fetch KB snippet via RAG
     docs = []
     rag_ms = 0
@@ -813,6 +841,9 @@ async def agent_message(req: AgentMessageRequest):
     sources = None
     llm_fallback = False
     llm_ms = 0
+    price_ms = 0
+    quote_ms = 0
+    quote_obj = None
 
     def _extract_plan_section(txt: str, plan_en: str, plan_ru: str) -> str:
         import re as _re
@@ -845,19 +876,52 @@ async def agent_message(req: AgentMessageRequest):
             "Plus": "(до 10 пользователей включено)",
             "Business": "(до 25 пользователей включено)",
         }.get(plan, "")
-        sys = SYSTEM_BASE + (
-            "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Пиши по‑русски, живым человеческим языком (без канцеляризмов и англицизмов)." \
-            "\nФормат ответа:" \
-            "\n— Короткий приветствующий лид из 1 фразы (без общих рассуждений)." \
-            "\n— Цена: 1 короткая фраза." \
-            "\n— Ключевые выгоды плана: 3–5 маркеров «— …» только про этот план (не упоминай другие планы и не пиши ‘всё из Базового’)." \
-            "\n— Заверши дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’). Мягко предложи выбрать период оплаты (месяц/год; за год — скидка 20%) и попроси e‑mail администратора для приглашения команды " + included_hint + ". Пиши просто и по‑человечески." \
-            "\nИспользуй только факты из [DOC]."
-        )
-        messages = [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": f"Пользователь хочет оформить план {plan}. На основе [DOC] опиши цену, ключевые выгоды и мягко предложи, что сделать дальше (без слов ‘Следующий шаг’).\n\n[DOC]\n{context}"},
-        ]
+        st_now_for_prompt = sales.get(session_id)
+        greeted = bool(st_now_for_prompt.get("greeted"))
+        has_billing = st_now_for_prompt.get("billing") in ("monthly", "annual")
+        has_email = bool(st_now_for_prompt.get("admin_email"))
+        # Build CTA text depending on what is already provided
+        if has_billing and has_email:
+            bill_txt = "помесячной" if st_now_for_prompt.get("billing") == "monthly" else "годовой"
+            cta_text = f"Оформляю по {bill_txt} оплате и отправлю предложение на {st_now_for_prompt.get('admin_email')}."
+        elif has_billing and not has_email:
+            bill_txt = "помесячной" if st_now_for_prompt.get("billing") == "monthly" else "годовой"
+            cta_text = f"Оформлю по {bill_txt} оплате. Укажите e‑mail администратора для приглашения команды {included_hint}."
+        elif (not has_billing) and has_email:
+            cta_text = f"Приглашу команду на {st_now_for_prompt.get('admin_email')}. Удобнее платить помесячно или за год (−20%)?"
+        else:
+            cta_text = f"Хотите выбрать период оплаты (месяц/год; за год — скидка 20%)? И пришлите e‑mail администратора для приглашения команды {included_hint}."
+        if not greeted:
+            sys = SYSTEM_BASE + (
+                "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Пиши по‑русски, живым человеческим языком (без канцеляризмов и англицизмов)." \
+                "\nФормат ответа:" \
+                "\n— Короткий приветствующий лид из 1 фразы (без общих рассуждений). Если параметры подходят, начни с ‘Отличный выбор!’." \
+                "\n— Цена: 1 короткая фраза." \
+                "\n— Ключевые выгоды плана: 3–5 маркеров «— …» только про этот план (не упоминай другие планы и не пиши ‘всё из Базового’)." \
+                "\n— Заверши дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’). Если период оплаты или e‑mail уже указаны — не спрашивай повторно; подтверди это и двигайся вперёд. Заверши такой фразой: " + cta_text + " Пиши просто и по‑человечески." \
+                "\nИспользуй только факты из [DOC]."
+            )
+        else:
+            sys = SYSTEM_BASE + (
+                "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Пиши по‑русски, живым человеческим языком (без канцеляризмов и англицизмов)." \
+                "\nФормат ответа:" \
+                "\n— Цена: 1 короткая фраза." \
+                "\n— Ключевые выгоды плана: 3–5 маркеров «— …» только про этот план (не упоминай другие планы и не пиши ‘всё из Базового’)." \
+                "\n— Заверши дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’). Если период оплаты или e‑mail уже указаны — не спрашивай повторно; подтверди это и двигайся вперёд. Заверши такой фразой: " + cta_text + " Пиши просто и по‑человечески." \
+                "\nИспользуй только факты из [DOC]."
+            )
+        # Build conversational context (last 8 turns)
+        convo = [{"role": "system", "content": sys}]
+        try:
+            hist = get_session_messages(session_id)
+        except Exception:
+            hist = []
+        for role, content in hist[-8:]:
+            if role in ("user", "assistant"):
+                convo.append({"role": role, "content": content})
+        # Append task instruction with DOC
+        convo.append({"role": "user", "content": f"Пользователь хочет оформить план {plan}. На основе [DOC] опиши цену, ключевые выгоды и мягко предложи, что сделать дальше (без слов ‘Следующий шаг’).\n\n[DOC]\n{context}"})
+        messages = convo
         try:
             _lt0 = _t.perf_counter()
             reply, _, _ = await llm_client.chat(messages)
@@ -865,6 +929,12 @@ async def agent_message(req: AgentMessageRequest):
         except Exception:
             reply = f"План {plan}: см. детали в документации."
             llm_fallback = True
+        # Mark greeted after first pitch
+        if not greeted:
+            try:
+                sales.update(session_id, greeted=True)
+            except Exception:
+                pass
         def _src_item(d: dict) -> dict:
             md = d.get("metadata") or {}
             doc = (d.get("document", "") or "").replace("\n", " ")
@@ -885,25 +955,78 @@ async def agent_message(req: AgentMessageRequest):
                 "snippet": snip,
             }
         sources = [_src_item(d) for d in docs]
+        # If user already provided billing + admin_email, emit a quote
+        try:
+            st_now = sales.get(session_id)
+            if st_now.get("admin_email") and st_now.get("billing") in ("monthly", "annual") and calls < max_calls:
+                # price_calc (stub)
+                calls += 1; tools_used.append("price_calc")
+                _pt0 = _t.perf_counter()
+                monthly = {"Basic":29.0, "Plus":99.0, "Business":299.0}.get(plan, 0.0)
+                if st_now.get("billing") == "annual":
+                    base = monthly * 12 * 0.8
+                else:
+                    base = monthly
+                total = base
+                price_ms = int((_t.perf_counter() - _pt0) * 1000)
+                # create_quote (stub)
+                import uuid as _uuid, datetime as _dt
+                calls += 1; tools_used.append("create_quote")
+                _qt0 = _t.perf_counter()
+                qid = str(_uuid.uuid4())
+                quote_obj = {
+                    "quote_id": qid,
+                    "url": f"https://example.local/quote/{qid}",
+                    "plan": plan,
+                    "billing": st_now.get("billing"),
+                    "seats": st_now.get("seats"),
+                    "total_usd": round(total, 2),
+                    "sent_to": st_now.get("admin_email"),
+                }
+                quote_ms = int((_t.perf_counter() - _qt0) * 1000)
+                reply = (reply + "\n\n— Оформил предложение: " + quote_obj["url"] +
+                         f" (отправил на {quote_obj['sent_to']}).")
+                sales.update(session_id, stage="quoted")
+            else:
+                sales.update(session_id, stage="confirm")
+        except Exception:
+            pass
     else:
-        # Uncertain plan → LLM negotiator (strict ru-only): exactly 2 questions + one next step line
-        sys = (
-            SYSTEM_BASE +
-            "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Только по‑русски, без эмодзи и иностранных символов." \
-            "\nФормат ответа:" \
-            "\n— Короткая приветственная фраза (1 строка)." \
-            "\n— Два уточняющих вопроса (каждый с маркером «— …», очень коротко)." \
-            "\n— Заверши 1 дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’), например: ‘Ответьте — подберу план и пришлю ссылку на оплату/счёт сегодня’."
-        )
+        # Uncertain plan → LLM negotiатор (strict ru-only): exactly 2 questions + friendly CTA
+        greeted = bool(sales.get(session_id).get("greeted"))
+        if not greeted:
+            sys = (
+                SYSTEM_BASE +
+                "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Только по‑русски, без эмодзи и иностранных символов." \
+                "\nФормат ответа:" \
+                "\n— Короткая приветственная фраза (1 строка)." \
+                "\n— Два уточняющих вопроса (каждый с маркером «— …», очень коротко)." \
+                "\n— Заверши 1 дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’), например: ‘Ответьте — подберу план и пришлю ссылку на оплату/счёт сегодня’."
+            )
+        else:
+            sys = (
+                SYSTEM_BASE +
+                "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Только по‑русски, без эмодзи и иностранных символов." \
+                "\nФормат ответа:" \
+                "\n— Два уточняющих вопроса (каждый с маркером «— …», очень коротко)." \
+                "\n— Заверши 1 дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’), например: ‘Ответьте — подберу план и пришлю ссылку на оплату/счёт сегодня’."
+            )
         user_msg = (
             "Клиент не уверен в плане (Basic/Plus/Business). Задай ровно 2 лаконичных вопроса, "
             "которые помогут выбрать план по числу пользователей, каналам (email/чат/WhatsApp) и требованиям (SSO/аналитика). "
             "Затем предложи один следующий шаг. Текст клиента: " + text
         )
-        messages = [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user_msg},
-        ]
+        # Build conversational context (last 8 turns)
+        convo = [{"role": "system", "content": sys}]
+        try:
+            hist = get_session_messages(session_id)
+        except Exception:
+            hist = []
+        for role, content in hist[-8:]:
+            if role in ("user", "assistant"):
+                convo.append({"role": role, "content": content})
+        convo.append({"role": "user", "content": user_msg})
+        messages = convo
         try:
             _lt0 = _t.perf_counter()
             reply, _, _ = await llm_client.chat(messages)
@@ -915,9 +1038,21 @@ async def agent_message(req: AgentMessageRequest):
                 "Следующий шаг: после ответа предложу подходящий план и ссылку на оформление."
             )
             llm_fallback = True
+        # mark greeted to avoid repeated salutations in subsequent turns
+        try:
+            if not greeted:
+                sales.update(session_id, greeted=True)
+        except Exception:
+            pass
 
-    lat = {"rag_ms": rag_ms, "llm_ms": llm_ms, "total_ms": int((_t.perf_counter() - t0) * 1000)}
-    return AgentMessageResponse(session_id=session_id, tools_used=tools_used, reply=reply or "", sources=sources, latencies=lat, llm_fallback=llm_fallback)
+    lat = {"rag_ms": rag_ms, "llm_ms": llm_ms, "price_ms": price_ms, "quote_ms": quote_ms, "total_ms": int((_t.perf_counter() - t0) * 1000)}
+    st_out = sales.get(session_id)
+    # Persist assistant reply
+    try:
+        add_message(session_id, "assistant", reply or "")
+    except Exception:
+        pass
+    return AgentMessageResponse(session_id=session_id, tools_used=tools_used, reply=reply or "", sources=sources, latencies=lat, llm_fallback=llm_fallback, stage=st_out.get("stage"), slots={k: st_out.get(k) for k in ("seats","channels","billing","admin_email","plan_candidate")}, quote=quote_obj)
 
 
 # ---------- Admin: KB reseed from files ----------

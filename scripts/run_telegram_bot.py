@@ -6,11 +6,21 @@ import logging
 
 import httpx
 from telegram import Update
+from dotenv import load_dotenv
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+load_dotenv()  # load .env if present
+
+def _env_first(*keys: str, default: str = "") -> str:
+    for k in keys:
+        v = os.getenv(k)
+        if v:
+            return v
+    return default
+
+API_BASE = _env_first("API_BASE", default="http://localhost:8000")
+BOT_TOKEN = _env_first("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "BOT_TOKEN", default="")
 SESS_FILE = os.getenv("TG_SESS_FILE", ".tg_sessions.json")
 
 logging.basicConfig(level=logging.INFO)

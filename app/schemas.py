@@ -51,6 +51,9 @@ class AgentMessageResponse(BaseModel):
     sources: Optional[List[dict]] = None
     latencies: Optional[dict] = None
     llm_fallback: bool = False
+    stage: Optional[str] = None
+    slots: Optional[dict] = None
+    quote: Optional[dict] = None
 
 # -------- Admin Schemas --------
 class AdminClassIn(BaseModel):
