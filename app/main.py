@@ -106,10 +106,11 @@ async def _classify(text: str) -> tuple[str, float]:
     names = app_cache.classes_names()
     labels = names if names else ["техподдержка", "продажи", "жалоба"]
     label_map = {i: lbl for i, lbl in enumerate(labels)}
+    idx_range = "|".join(str(i) for i in range(len(labels)))
     cls_prompt = (
         "Категории: " + "; ".join(f"{i}={lbl}" for i, lbl in label_map.items()) + ". "
-        "Верни строго один JSON без пробелов и переносов: {\"i\":<0|1|2>,\"p\":<0..1>}. "
-        "Только JSON. Запрос: " + text
+        f"Выбери ровно одну. Ответь строго одним JSON без пробелов: {{\\\"index\\\":<{idx_range}>,\\\"confidence\\\":<0.00-1.00>}}. "
+        "Пример: {\"index\":1,\"confidence\":0.92}. Только JSON. Запрос: " + text
     )
     out = ""; lat_ms = 0; err_note = None
     attempts = 0
@@ -123,11 +124,12 @@ async def _classify(text: str) -> tuple[str, float]:
             continue
         data = _extract_json(out) or {}
         try:
-            idx = int(data.get("i")) if "i" in data else None
+            idx = int(data.get("index", data.get("i", 0)))
         except Exception:
             idx = None
+        val = data.get("confidence", data.get("c", data.get("p", 0.0)))
         try:
-            p = float(data.get("p", 0.0))
+            p = float(val)
         except Exception:
             p = 0.0
         p = max(0.0, min(1.0, p))
@@ -148,11 +150,12 @@ async def _classify(text: str) -> tuple[str, float]:
         out, lat_ms = await llm_client.classify_chat_json(chat_messages, max_tokens=settings.classify_max_tokens, model=cls_model)
         data = _extract_json(out) or {}
         try:
-            idx = int(data.get("i")) if "i" in data else None
+            idx = int(data.get("index", data.get("i", 0)))
         except Exception:
             idx = None
+        val = data.get("confidence", data.get("c", data.get("p", 0.0)))
         try:
-            p = float(data.get("p", 0.0))
+            p = float(val)
         except Exception:
             p = 0.0
         p = max(0.0, min(1.0, p))
