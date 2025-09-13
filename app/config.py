@@ -17,6 +17,8 @@ class Settings(BaseModel):
     # Backwards-compat: REPLY_MAX_TOKENS overrides LLM_MAX_TOKENS
     reply_max_tokens: int = int(os.getenv("REPLY_MAX_TOKENS", os.getenv("LLM_MAX_TOKENS", "256")))
     classify_max_tokens: int = int(os.getenv("CLASSIFY_MAX_TOKENS", "16"))
+    classify_strict: bool = bool(int(os.getenv("CLASSIFY_STRICT", "1")))
+    classify_model: str = os.getenv("CLASSIFY_MODEL", "gpt-4o-mini")
 
     # Feature flags
     enable_rag: bool = bool(int(os.getenv("ENABLE_RAG", "0")))
@@ -31,5 +33,12 @@ class Settings(BaseModel):
     rag_use_openai_embeddings: bool = bool(int(os.getenv("RAG_USE_OPENAI_EMBEDDINGS", "1")))
     rag_chunk_chars: int = int(os.getenv("RAG_CHUNK_CHARS", "800"))
     rag_chunk_overlap: int = int(os.getenv("RAG_CHUNK_OVERLAP", "120"))
+
+    # Admin / storage / testing
+    admin_token: str = os.getenv("ADMIN_TOKEN", "")
+    max_upload_mb: int = int(os.getenv("MAX_UPLOAD_MB", "8"))
+    rag_storage_dir: str = os.getenv("RAG_STORAGE_DIR", "./storage/rag")
+    rag_hard_delete: bool = bool(int(os.getenv("RAG_HARD_DELETE", "0")))
+    openai_mock: bool = bool(int(os.getenv("OPENAI_MOCK", "0")))
 
 settings = Settings()

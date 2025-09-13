@@ -1,6 +1,8 @@
 from __future__ import annotations
 import uuid, json, re
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+import json as _json
+import time as _time
 from fastapi.middleware.cors import CORSMiddleware
 from .schemas import *
 from .config import settings
@@ -9,6 +11,8 @@ from .memory import add_message, get_session_messages
 from .llm import llm_client
 from .rag import rag_available, rag_unavailable_reason, ingest_texts, search
 from .vision import vision_available, vision_unavailable_reason, classify_image
+from . import db
+from . import cache as app_cache
 
 app = FastAPI(title="CallCenter LLM + RAG + Vision")
 app.add_middleware(
@@ -28,6 +32,11 @@ def features():
         mp = True
     except Exception:
         mp = False
+    # Cache and RAG metrics
+    try:
+        metrics = db.rag_doc_metrics()
+    except Exception:
+        metrics = {"active": 0, "dirty": 0}
     return {
         "model": getattr(settings, "openai_model", None),
         "use_responses": getattr(settings, "openai_use_responses", None),
@@ -40,6 +49,13 @@ def features():
             "reason": vision_unavailable_reason,
             "multipart": mp,
             "backend": getattr(settings, "vision_backend", None),
+        },
+        "admin": {
+            "caches": {
+                "classes": len(app_cache.classes_cache()),
+                "vision_labels": len(app_cache.vision_labels_cache()),
+            },
+            "rag_docs": metrics,
         },
     }
 
@@ -61,10 +77,17 @@ def _classify_heuristic(text: str) -> tuple[str, float]:
     return "техподдержка", 0.7
 
 def _normalize_category(cat: str) -> str:
-    cat = (cat or "").strip().lower()
+    cat_l = (cat or "").strip().lower()
+    if not cat_l:
+        return ""
+    mp = app_cache.classes_normalization_map()
+    if mp:
+        # Only return a value if we have a direct match; otherwise let caller fallback to heuristic
+        return mp.get(cat_l, "")
+    # Fallback to baked-in mapping; return empty if unknown
     return {"техподдержка":"техподдержка", "поддержка":"техподдержка", "support":"техподдержка",
             "sales":"продажи", "продажи":"продажи",
-            "жалоба":"жалоба", "complaint":"жалоба"}.get(cat, "техподдержка")
+            "жалоба":"жалоба", "complaint":"жалоба"}.get(cat_l, "")
 
 def _extract_json(text: str) -> dict | None:
     s = text.strip()
@@ -80,20 +103,78 @@ async def _classify(text: str) -> tuple[str, float]:
     if not settings.openai_api_key:
         return _classify_heuristic(text)
     # Иначе пробуем LLM c JSON-ответом, при ошибке — эвристика
-    messages = [
-        {"role": "system", "content": SYSTEM_BASE},
-        {"role": "user", "content": CLASSIFY_PROMPT.format(text=text)},
-    ]
-    out, _, _ = await llm_client.chat(messages, max_tokens=settings.classify_max_tokens, temperature=0.0)
+    # Build category list from DB cache if present
+    names = app_cache.classes_names()
+    if names:
+        cats_str = ", ".join(names)
+        prompt = (
+            "Классифицируй пользовательский запрос в одну категорию из: "
+            f"[{cats_str}]. Верни строго JSON без пояснений: {{\\\"category\\\":\\\"<категория>\\\",\\\"confidence\\\":<0..1>}}.\n\n"
+            f"Запрос: {text}"
+        )
+    else:
+        prompt = CLASSIFY_PROMPT.format(text=text)
+    # Try Responses (gpt-5) minimal reasoning; if model rejects or 5xx occurs, use Chat with classify_model for this microtask
+    out = ""
+    lat_ms = 0
+    use_responses = bool(getattr(settings, "openai_use_responses", True)) and str(getattr(settings, "openai_model", "")).startswith("gpt-5")
+    err_note = None
+    if use_responses:
+        schema = {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "enum": names if names else ["техподдержка", "продажи", "жалоба"]},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            },
+            "required": ["category", "confidence"],
+            "additionalProperties": False,
+        }
+        out, lat_ms = await llm_client.classify_json(prompt, max_tokens=settings.classify_max_tokens, json_schema=schema)
+        if out.startswith("[offline]") or out.startswith("[incomplete:"):
+            err_note = out
+    if (not use_responses) or err_note:
+        # Chat fallback for classifier ONLY (no heuristics): require JSON object
+        cls_model = getattr(settings, "classify_model", "gpt-4o-mini")
+        chat_messages = [
+            {"role": "system", "content": "Верни строго JSON объект без пояснений."},
+            {"role": "user", "content": prompt},
+        ]
+        out, lat_ms = await llm_client.classify_chat_json(chat_messages, max_tokens=settings.classify_max_tokens, model=cls_model)
     data = _extract_json(out) or {}
-    cat = _normalize_category(str(data.get("category", "")))
+    raw_cat = str(data.get("category", ""))
+    cat = _normalize_category(raw_cat)
     try:
         conf = float(data.get("confidence", 0.7))
     except Exception:
         conf = 0.7
     conf = max(0.0, min(1.0, conf))
+    # Debug output for classification
+    try:
+        debug = {
+            "cls_strict": settings.classify_strict,
+            "model": getattr(settings, "openai_model", None),
+            "cats_from_db": names,
+            "prompt": prompt,
+            "raw_output": out,
+            "parsed": data,
+            "raw_category": raw_cat,
+            "normalized_category": cat,
+            "llm_latency_ms": lat_ms,
+        }
+        print("[cls-debug] " + _json.dumps(debug, ensure_ascii=False))
+    except Exception:
+        pass
     if not cat:
-        cat, conf = _classify_heuristic(text)
+        # Strict: no heuristic; fail clearly
+        try:
+            print("[cls-debug-final] " + _json.dumps({"mode":"strict-fail","reason": err_note or "normalize_empty", "raw": out}, ensure_ascii=False))
+        except Exception:
+            pass
+        raise HTTPException(502, "classifier_failed")
+    try:
+        print("[cls-debug-final] " + _json.dumps({"mode":"llm","final_category": cat, "confidence": conf}, ensure_ascii=False))
+    except Exception:
+        pass
     return cat, conf
 
 @app.post("/dialog/message", response_model=MessageResponse)
@@ -107,7 +188,9 @@ async def send_message(req: MessageRequest):
 
     # классификация
     category, confidence = await _classify(user_text)
-    sys_prompt = PROMPTS_BY_TYPE.get(category, "")
+    # Choose system prompt: DB category prompt if available, else fallback
+    db_prompts = app_cache.classes_prompts_map()
+    sys_prompt = db_prompts.get(category) or PROMPTS_BY_TYPE.get(category, "")
 
     messages = [{"role": "system", "content": SYSTEM_BASE + "\n" + sys_prompt}]
     # Подмешиваем краткий контекст (последние 8 сообщений)
@@ -206,3 +289,79 @@ else:
         if not multipart_available:
             raise HTTPException(503, 'python-multipart not installed in current interpreter')
         raise HTTPException(503, "Vision unavailable")
+
+
+@app.on_event("startup")
+def _startup():
+    # Run migrations, ensure storage dirs, warm caches
+    try:
+        db.run_migrations()
+    except Exception:
+        pass
+    # Seed defaults if tables empty
+    inserted = None
+    try:
+        inserted = db.bootstrap_defaults()
+    except Exception:
+        inserted = None
+    try:
+        db.ensure_storage_dirs()
+    except Exception:
+        pass
+    try:
+        app_cache.reload_caches()
+    except Exception:
+        pass
+    # Optional initial RAG ingest for seeded inline docs
+    try:
+        if settings.enable_rag and rag_available and inserted and inserted.get("rag_docs", 0) > 0:
+            texts = db.load_active_inline_docs()
+            if texts:
+                ingest_texts(texts, metadatas=[{"source": "bootstrap"} for _ in texts])
+                try:
+                    db.mark_inline_indexed(getattr(settings, "openai_embed_model", ""))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _require_admin(req: Request):
+    token = req.headers.get("authorization") or req.headers.get("Authorization")
+    expected = settings.admin_token.strip()
+    if not expected:
+        raise HTTPException(401, "ADMIN_TOKEN is not configured")
+    if not token or not token.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing Bearer token")
+    value = token.split(" ", 1)[1].strip()
+    if value != expected:
+        raise HTTPException(403, "Invalid admin token")
+
+
+@app.post("/admin/bootstrap")
+def admin_bootstrap(req: Request):
+    _require_admin(req)
+    db.run_migrations()
+    ins = db.bootstrap_defaults()
+    app_cache.reload_caches()
+    rag_ingested = 0
+    if settings.enable_rag and rag_available and ins.get("rag_docs", 0) > 0:
+        try:
+            texts = db.load_active_inline_docs()
+            if texts:
+                ingest_texts(texts, metadatas=[{"source": "bootstrap"} for _ in texts])
+                rag_ingested = len(texts)
+                try:
+                    db.mark_inline_indexed(getattr(settings, "openai_embed_model", ""))
+                except Exception:
+                    pass
+        except Exception:
+            rag_ingested = 0
+    return {
+        "inserted": ins,
+        "caches": {
+            "classes": len(app_cache.classes_cache()),
+            "vision_labels": len(app_cache.vision_labels_cache()),
+        },
+        "rag": {"ingested": rag_ingested, "enabled": settings.enable_rag, "available": rag_available},
+    }

@@ -107,10 +107,25 @@ def search(query: str, top_k: int = 4):
     res = collection.query(query_embeddings=[q_emb], n_results=top_k, include=["documents", "metadatas", "distances"])
     items = []
     for i in range(len(res["ids"][0])):
+        d = res.get("distances", [[None]])[0][i]
+        # Normalize distance to a similarity-like score in [0,1]
+        score: float
+        try:
+            dv = float(d) if d is not None else None
+        except Exception:
+            dv = None
+        if dv is None:
+            score = 0.0
+        elif 0.0 <= dv <= 1.0:
+            score = 1.0 - dv
+        elif 1.0 < dv <= 2.0:
+            score = max(0.0, 1.0 - (dv / 2.0))
+        else:
+            score = max(0.0, 1.0 / (1.0 + dv)) if dv is not None else 0.0
         items.append({
             "id": res["ids"][0][i],
             "document": res["documents"][0][i],
             "metadata": res.get("metadatas", [[{}]])[0][i] or {},
-            "score": float(1.0 - (res.get("distances", [[1.0]])[0][i] or 1.0)),
+            "score": float(score),
         })
     return items
