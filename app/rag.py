@@ -129,3 +129,22 @@ def search(query: str, top_k: int = 4):
             "score": float(score),
         })
     return items
+
+def delete_by_doc_id(doc_id: int) -> int:
+    _require_available()
+    try:
+        collection.delete(where={"doc_id": str(int(doc_id))})
+        try:
+            client.persist()
+        except Exception:
+            pass
+        return 1
+    except Exception:
+        return 0
+
+def chunk_count(text: str) -> int:
+    chunks = _chunk_text(text or "", settings.rag_chunk_chars, settings.rag_chunk_overlap)
+    return len(chunks)
+
+def get_embed_note() -> str:
+    return _embed_note or ""

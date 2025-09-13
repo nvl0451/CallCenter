@@ -15,6 +15,7 @@ from .rag import rag_available, rag_unavailable_reason, ingest_texts, search
 from .vision import vision_available, vision_unavailable_reason, classify_image
 from . import db
 from . import cache as app_cache
+from . import rag as rag_mod
 
 app = FastAPI(title="CallCenter LLM + RAG + Vision")
 app.add_middleware(
@@ -486,3 +487,168 @@ def admin_update_stems(req: Request):
     updated = _db.update_default_stems()
     app_cache.reload_caches()
     return {"updated_rows": updated}
+
+# -------- Admin CRUD: Classes --------
+@app.get("/admin/classes", response_model=list[AdminClassOut])
+def admin_list_classes(req: Request):
+    _require_admin(req)
+    return db.fetch_classes(active_only=False)
+
+@app.post("/admin/classes", response_model=AdminClassOut)
+def admin_create_class(req: Request, body: AdminClassIn):
+    _require_admin(req)
+    new_id = db.insert_class(body.name, body.synonyms, body.stems, body.system_prompt, body.priority, body.active)
+    app_cache.reload_caches()
+    rows = db.fetch_classes(active_only=False)
+    return next(r for r in rows if r["id"] == new_id)
+
+@app.put("/admin/classes/{cls_id}", response_model=AdminClassOut)
+def admin_update_class(req: Request, cls_id: int, body: AdminClassIn):
+    _require_admin(req)
+    db.update_class(
+        cls_id,
+        name=body.name,
+        synonyms=body.synonyms,
+        stems=body.stems,
+        system_prompt=body.system_prompt,
+        priority=body.priority,
+        active=body.active,
+    )
+    app_cache.reload_caches()
+    rows = db.fetch_classes(active_only=False)
+    return next(r for r in rows if r["id"] == int(cls_id))
+
+@app.delete("/admin/classes/{cls_id}")
+def admin_delete_class(req: Request, cls_id: int):
+    _require_admin(req)
+    changed = db.soft_delete_class(cls_id)
+    app_cache.reload_caches()
+    return {"deleted": changed}
+
+# -------- Admin CRUD: Vision Labels --------
+@app.get("/admin/vision", response_model=list[AdminVisionOut])
+def admin_list_vision(req: Request):
+    _require_admin(req)
+    return db.fetch_vision_labels(active_only=False)
+
+@app.post("/admin/vision", response_model=AdminVisionOut)
+def admin_create_vision(req: Request, body: AdminVisionIn):
+    _require_admin(req)
+    new_id = db.insert_vision_label(body.name, body.synonyms, body.templates, body.priority, body.active)
+    app_cache.reload_caches()
+    rows = db.fetch_vision_labels(active_only=False)
+    return next(r for r in rows if r["id"] == new_id)
+
+@app.put("/admin/vision/{lbl_id}", response_model=AdminVisionOut)
+def admin_update_vision(req: Request, lbl_id: int, body: AdminVisionIn):
+    _require_admin(req)
+    db.update_vision_label(lbl_id, name=body.name, synonyms=body.synonyms, templates=body.templates, priority=body.priority, active=body.active)
+    app_cache.reload_caches()
+    rows = db.fetch_vision_labels(active_only=False)
+    return next(r for r in rows if r["id"] == int(lbl_id))
+
+@app.delete("/admin/vision/{lbl_id}")
+def admin_delete_vision(req: Request, lbl_id: int):
+    _require_admin(req)
+    changed = db.soft_delete_vision_label(lbl_id)
+    app_cache.reload_caches()
+    return {"deleted": changed}
+
+# -------- Admin CRUD: RAG Documents --------
+@app.get("/admin/rag/docs", response_model=list[AdminRagDocOut])
+def admin_list_rag_docs(req: Request):
+    _require_admin(req)
+    return db.list_rag_documents(active_only=False)
+
+@app.post("/admin/rag/inline", response_model=AdminRagDocOut)
+def admin_create_rag_inline(req: Request, body: AdminRagInlineIn):
+    _require_admin(req)
+    doc_id = db.insert_rag_inline(body.title, body.content_text, source="admin-inline")
+    # Try to index synchronously if enabled and requested
+    if settings.enable_rag and rag_available and body.index_now:
+        try:
+            meta = {"source": "admin-inline", "doc_id": str(doc_id)}
+            rag_mod.ingest_texts([body.content_text], metadatas=[meta])
+            db.update_rag_doc(doc_id, indexed_at=_time.time(), embed_model=rag_mod.get_embed_note(), chunks_count=rag_mod.chunk_count(body.content_text), dirty=0)
+        except Exception:
+            pass
+    row = db.get_rag_doc(doc_id)
+    return row  # type: ignore
+
+# Multipart upload for .txt/.md
+try:
+    from fastapi import UploadFile, File, Form
+    _mp_ok = True
+except Exception:
+    _mp_ok = False
+
+if _mp_ok:
+    import os, re as _re, hashlib
+    def _slugify(name: str) -> str:
+        s = name.lower().strip()
+        s = _re.sub(r"[^a-z0-9а-яё_.-]+", "-", s)
+        s = _re.sub(r"-+", "-", s).strip("-")
+        return s or "doc"
+
+    @app.post("/admin/rag/file", response_model=AdminRagDocOut)
+    async def admin_upload_rag_file(req: Request, file: UploadFile = File(...), index_now: int = Form(1)):
+        _require_admin(req)
+        # Validate ext
+        fname = file.filename or "upload.txt"
+        ext = (fname.rsplit(".", 1)[-1] or "").lower()
+        if ext not in ("txt", "md"):
+            raise HTTPException(400, "Only .txt and .md are allowed")
+        # Read bytes with limit
+        raw = await file.read()
+        if len(raw) > settings.max_upload_mb * 1024 * 1024:
+            raise HTTPException(413, f"File too large, limit {settings.max_upload_mb} MB")
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+        sha = hashlib.sha256(raw).hexdigest()
+        mime = "text/markdown" if ext == "md" else "text/plain"
+        # Insert placeholder to obtain id
+        new_id = db.insert_rag_file(title=fname, rel_path="", bytes_len=len(raw), sha256=sha, mime=mime, source="admin-upload")
+        # Build final storage path
+        db.ensure_storage_dirs()
+        slug = _slugify(fname)
+        rel_name = f"{new_id}_{slug}"
+        abs_dir = settings.rag_storage_dir
+        abs_path = os.path.join(abs_dir, rel_name)
+        with open(abs_path, "wb") as f:
+            f.write(raw)
+        db.update_rag_doc(new_id, rel_path=rel_name)
+        # Optional indexing
+        if settings.enable_rag and rag_available and int(index_now) == 1:
+            try:
+                meta = {"source": "admin-upload", "doc_id": str(new_id), "filename": fname}
+                rag_mod.ingest_texts([text], metadatas=[meta])
+                db.update_rag_doc(new_id, indexed_at=_time.time(), embed_model=rag_mod.get_embed_note(), chunks_count=rag_mod.chunk_count(text), dirty=0)
+            except Exception:
+                pass
+        row = db.get_rag_doc(new_id)
+        return row  # type: ignore
+
+@app.delete("/admin/rag/docs/{doc_id}")
+def admin_delete_rag_doc(req: Request, doc_id: int):
+    _require_admin(req)
+    row = db.get_rag_doc(doc_id)
+    if not row:
+        raise HTTPException(404, "not found")
+    # Try to delete from vector DB by metadata filter
+    try:
+        if settings.enable_rag and rag_available:
+            rag_mod.delete_by_doc_id(doc_id)
+    except Exception:
+        pass
+    # Soft delete row
+    changed = db.soft_delete_rag_doc(doc_id)
+    # Optionally physically delete file
+    if settings.rag_hard_delete and row.get("kind") == "file" and row.get("rel_path"):
+        try:
+            import os
+            os.remove(os.path.join(settings.rag_storage_dir, row["rel_path"]))
+        except Exception:
+            pass
+    return {"deleted": changed}

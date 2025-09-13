@@ -106,6 +106,68 @@ def fetch_active_classes() -> List[Dict]:
     conn.close()
     return rows
 
+def fetch_classes(active_only: bool = True) -> List[Dict]:
+    conn = connect()
+    cur = conn.cursor()
+    if active_only:
+        cur.execute(
+            "SELECT id, name, synonyms_json, stems_json, system_prompt, priority, active, updated_at FROM cls_categories WHERE active=1 ORDER BY priority DESC, id ASC"
+        )
+    else:
+        cur.execute(
+            "SELECT id, name, synonyms_json, stems_json, system_prompt, priority, active, updated_at FROM cls_categories ORDER BY priority DESC, id ASC"
+        )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+def insert_class(name: str, synonyms: List[str] | None, stems: List[str] | None, system_prompt: str, priority: int, active: int = 1) -> int:
+    conn = connect(); cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO cls_categories(name, synonyms_json, stems_json, system_prompt, priority, active, updated_at) VALUES(?,?,?,?,?,?,?)",
+        (
+            name.strip(),
+            json.dumps(synonyms or [], ensure_ascii=False),
+            json.dumps(stems or [], ensure_ascii=False),
+            system_prompt or "",
+            int(priority or 0),
+            int(1 if active else 0),
+            _now(),
+        ),
+    )
+    new_id = int(cur.lastrowid)
+    conn.commit(); conn.close()
+    return new_id
+
+def update_class(cls_id: int, **fields) -> int:
+    allowed = {"name", "synonyms_json", "stems_json", "system_prompt", "priority", "active"}
+    sets = []
+    params: List = []
+    for k, v in fields.items():
+        if k in ("synonyms",):
+            k = "synonyms_json"; v = json.dumps(v or [], ensure_ascii=False)
+        if k in ("stems",):
+            k = "stems_json"; v = json.dumps(v or [], ensure_ascii=False)
+        if k not in allowed:
+            continue
+        sets.append(f"{k}=?")
+        params.append(v)
+    if not sets:
+        return 0
+    params.extend([_now(), int(cls_id)])
+    conn = connect(); cur = conn.cursor()
+    cur.execute(f"UPDATE cls_categories SET {', '.join(sets)}, updated_at=? WHERE id=?", params)
+    changed = cur.rowcount or 0
+    conn.commit(); conn.close()
+    return changed
+
+def soft_delete_class(cls_id: int) -> int:
+    conn = connect(); cur = conn.cursor()
+    cur.execute("UPDATE cls_categories SET active=0, updated_at=? WHERE id=?", (_now(), int(cls_id)))
+    changed = cur.rowcount or 0
+    conn.commit(); conn.close()
+    return changed
+
 
 def fetch_active_vision_labels() -> List[Dict]:
     conn = connect()
@@ -116,6 +178,64 @@ def fetch_active_vision_labels() -> List[Dict]:
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
+
+def fetch_vision_labels(active_only: bool = True) -> List[Dict]:
+    conn = connect(); cur = conn.cursor()
+    if active_only:
+        cur.execute(
+            "SELECT id, name, synonyms_json, templates_json, priority, active, updated_at FROM vision_labels WHERE active=1 ORDER BY priority DESC, id ASC"
+        )
+    else:
+        cur.execute(
+            "SELECT id, name, synonyms_json, templates_json, priority, active, updated_at FROM vision_labels ORDER BY priority DESC, id ASC"
+        )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close();
+    return rows
+
+def insert_vision_label(name: str, synonyms: List[str] | None, templates: List[str] | None, priority: int, active: int = 1) -> int:
+    conn = connect(); cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO vision_labels(name, synonyms_json, templates_json, priority, active, updated_at) VALUES(?,?,?,?,?,?)",
+        (
+            name.strip(),
+            json.dumps(synonyms or [], ensure_ascii=False),
+            json.dumps(templates or [], ensure_ascii=False),
+            int(priority or 0),
+            int(1 if active else 0),
+            _now(),
+        ),
+    )
+    new_id = int(cur.lastrowid)
+    conn.commit(); conn.close()
+    return new_id
+
+def update_vision_label(lbl_id: int, **fields) -> int:
+    allowed = {"name", "synonyms_json", "templates_json", "priority", "active"}
+    sets = []; params: List = []
+    for k, v in fields.items():
+        if k in ("synonyms",):
+            k = "synonyms_json"; v = json.dumps(v or [], ensure_ascii=False)
+        if k in ("templates",):
+            k = "templates_json"; v = json.dumps(v or [], ensure_ascii=False)
+        if k not in allowed:
+            continue
+        sets.append(f"{k}=?"); params.append(v)
+    if not sets:
+        return 0
+    params.extend([_now(), int(lbl_id)])
+    conn = connect(); cur = conn.cursor()
+    cur.execute(f"UPDATE vision_labels SET {', '.join(sets)}, updated_at=? WHERE id=?", params)
+    changed = cur.rowcount or 0
+    conn.commit(); conn.close()
+    return changed
+
+def soft_delete_vision_label(lbl_id: int) -> int:
+    conn = connect(); cur = conn.cursor()
+    cur.execute("UPDATE vision_labels SET active=0, updated_at=? WHERE id=?", (_now(), int(lbl_id)))
+    changed = cur.rowcount or 0
+    conn.commit(); conn.close()
+    return changed
 
 
 def rag_doc_metrics() -> Dict[str, int]:
@@ -323,6 +443,70 @@ def mark_inline_indexed(embed_model: str):
     )
     conn.commit()
     conn.close()
+
+def list_rag_documents(active_only: bool = True) -> List[Dict]:
+    conn = connect(); cur = conn.cursor()
+    if active_only:
+        cur.execute("SELECT * FROM rag_documents WHERE active=1 ORDER BY id DESC")
+    else:
+        cur.execute("SELECT * FROM rag_documents ORDER BY id DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close(); return rows
+
+def insert_rag_inline(title: str, content_text: str, source: str = "admin-inline") -> int:
+    now = _now()
+    sha = _sha256_text(content_text or "")
+    b = len((content_text or "").encode("utf-8"))
+    conn = connect(); cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO rag_documents (title, kind, rel_path, content_text, sha256, bytes, mime, source, active, created_at, updated_at, indexed_at, embed_model, chunks_count, dirty)
+        VALUES(?,?,?,?,?,?,?, ?,1, ?, ?, NULL, NULL, 0, 1)
+        """,
+        (title, "inline", None, content_text, sha, b, "text/markdown", source, now, now),
+    )
+    new_id = int(cur.lastrowid)
+    conn.commit(); conn.close(); return new_id
+
+def insert_rag_file(title: str, rel_path: str, bytes_len: int, sha256: str, mime: str | None, source: str = "admin-upload") -> int:
+    now = _now()
+    conn = connect(); cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO rag_documents (title, kind, rel_path, content_text, sha256, bytes, mime, source, active, created_at, updated_at, indexed_at, embed_model, chunks_count, dirty)
+        VALUES(?,?,?,?,?,?,?, ?,1, ?, ?, NULL, NULL, 0, 1)
+        """,
+        (title, "file", rel_path, None, sha256, int(bytes_len), mime, source, now, now),
+    )
+    new_id = int(cur.lastrowid)
+    conn.commit(); conn.close(); return new_id
+
+def update_rag_doc(doc_id: int, **fields) -> int:
+    allowed = {"title", "rel_path", "content_text", "sha256", "bytes", "mime", "source", "active", "dirty", "indexed_at", "embed_model", "chunks_count"}
+    sets = []; params: List = []
+    for k, v in fields.items():
+        if k not in allowed: continue
+        sets.append(f"{k}=?"); params.append(v)
+    if not sets:
+        return 0
+    params.extend([_now(), int(doc_id)])
+    conn = connect(); cur = conn.cursor()
+    cur.execute(f"UPDATE rag_documents SET {', '.join(sets)}, updated_at=? WHERE id=?", params)
+    changed = cur.rowcount or 0
+    conn.commit(); conn.close(); return changed
+
+def soft_delete_rag_doc(doc_id: int) -> int:
+    conn = connect(); cur = conn.cursor()
+    cur.execute("UPDATE rag_documents SET active=0, updated_at=? WHERE id=?", (_now(), int(doc_id)))
+    changed = cur.rowcount or 0
+    conn.commit(); conn.close(); return changed
+
+def get_rag_doc(doc_id: int) -> Dict | None:
+    conn = connect(); cur = conn.cursor()
+    cur.execute("SELECT * FROM rag_documents WHERE id=?", (int(doc_id),))
+    row = cur.fetchone()
+    conn.close();
+    return dict(row) if row else None
 
 
 def update_stems_bulk(stems_by_name: Dict[str, list]) -> int:
