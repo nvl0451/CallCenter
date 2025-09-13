@@ -55,3 +55,17 @@ def classes_prompts_map() -> Dict[str, str]:
 def classes_names() -> List[str]:
     return [str(r.get("name")) for r in _classes if str(r.get("name", "")).strip()]
 
+
+def classes_stems_map() -> Dict[str, List[str]]:
+    mp: Dict[str, List[str]] = {}
+    import json as _json
+    for row in _classes:
+        name = str(row.get("name", "")).strip()
+        if not name:
+            continue
+        try:
+            stems = _json.loads(row.get("stems_json") or "[]")
+        except Exception:
+            stems = []
+        mp[name] = [s for s in stems if isinstance(s, str) and s.strip()]
+    return mp

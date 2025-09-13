@@ -39,6 +39,7 @@ def run_migrations():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             synonyms_json TEXT NOT NULL DEFAULT '[]',
+            stems_json TEXT NOT NULL DEFAULT '[]',
             system_prompt TEXT NOT NULL DEFAULT '',
             priority INTEGER NOT NULL DEFAULT 0,
             active INTEGER NOT NULL DEFAULT 1,
@@ -46,6 +47,14 @@ def run_migrations():
         )
         """
     )
+    # Backfill stems_json for older installations
+    try:
+        cur.execute("PRAGMA table_info(cls_categories)")
+        cols = [r[1] for r in cur.fetchall()]
+        if 'stems_json' not in cols:
+            cur.execute("ALTER TABLE cls_categories ADD COLUMN stems_json TEXT NOT NULL DEFAULT '[]'")
+    except Exception:
+        pass
     # vision labels
     cur.execute(
         """
@@ -91,7 +100,7 @@ def fetch_active_classes() -> List[Dict]:
     conn = connect()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, name, synonyms_json, system_prompt, priority FROM cls_categories WHERE active=1 ORDER BY priority DESC, id ASC"
+        "SELECT id, name, synonyms_json, stems_json, system_prompt, priority FROM cls_categories WHERE active=1 ORDER BY priority DESC, id ASC"
     )
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -169,12 +178,18 @@ def bootstrap_defaults() -> Dict[str, int]:
             "продажи": ["sales"],
             "жалоба": ["complaint"],
         }
+        stems_map = {
+            "техподдержка": ["ошибк", "не запуска", "проблем", "support"],
+            "продажи": ["куп", "тариф", "цен", "оплат", "счёт", "подписк"],
+            "жалоба": ["жалоб", "возврат", "refund", "дважд"],
+        }
         for prio, name in enumerate(["техподдержка", "продажи", "жалоба" ][::-1]):
             cur.execute(
-                "INSERT INTO cls_categories(name, synonyms_json, system_prompt, priority, active, updated_at) VALUES(?,?,?,?,1,?)",
+                "INSERT INTO cls_categories(name, synonyms_json, stems_json, system_prompt, priority, active, updated_at) VALUES(?,?,?,?,?,1,?)",
                 (
                     name,
                     json.dumps(syns_map.get(name, []), ensure_ascii=False),
+                    json.dumps(stems_map.get(name, []), ensure_ascii=False),
                     prompts.get(name, ""),
                     prio, _now(),
                 ),

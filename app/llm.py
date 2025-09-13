@@ -115,7 +115,7 @@ class LLMClient:
                 input=_input,
                 max_output_tokens=max_tokens,
                 text={"verbosity": "low"},
-                reasoning={"effort": "minimal"},
+                # No reasoning for classifier to minimize latency
             )
             t1 = _time.perf_counter()
             try:

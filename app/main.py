@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Request
 import json as _json
 import time as _time
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
 from .schemas import *
 from .config import settings
 from .prompts import SYSTEM_BASE, CLASSIFY_PROMPT, PROMPTS_BY_TYPE
@@ -108,10 +109,26 @@ async def _classify(text: str) -> tuple[str, float, dict]:
     labels = names if names else ["техподдержка", "продажи", "жалоба"]
     label_map = {i: lbl for i, lbl in enumerate(labels)}
     idx_range = "|".join(str(i) for i in range(len(labels)))
+    # Build class lines with stems (from DB if available)
+    try:
+        from .cache import classes_stems_map as _stems_map
+        stems_mp = _stems_map()
+    except Exception:
+        stems_mp = {}
+    _defaults_stems = {
+        "техподдержка": ["ошибк", "не запуска", "проблем", "support"],
+        "продажи": ["куп", "тариф", "цен", "оплат", "счёт", "подписк"],
+        "жалоба": ["жалоб", "возврат", "refund", "дважд"],
+    }
+    _class_lines = []
+    for i, lbl in label_map.items():
+        _stems = stems_mp.get(lbl) or _defaults_stems.get(lbl, [])
+        _kw = ", ".join(_stems[:6]) if _stems else ""
+        _class_lines.append(f"{i}={lbl}{' (стемы: ' + _kw + ')' if _kw else ''}")
     cls_prompt = (
-        "Категории: " + "; ".join(f"{i}={lbl}" for i, lbl in label_map.items()) + ". "
+        "Категории: " + "; ".join(_class_lines) + ". "
         f"Выбери ровно одну. Ответь строго одним JSON без пробелов: {{\\\"index\\\":<{idx_range}>,\\\"confidence\\\":<0.00-1.00>}}. "
-        "Пример: {\"index\":1,\"confidence\":0.92}. Только JSON. Запрос: " + text
+        "Только JSON, без пояснений. Запрос: " + text
     )
     out = ""; lat_ms = 0; err_note = None
     attempts = 0
@@ -119,30 +136,74 @@ async def _classify(text: str) -> tuple[str, float, dict]:
     raw_cat = ""; cat = ""; conf = 0.0
     wall_t0 = _time.perf_counter()
     api_ms_total = 0
-    for shape in ("string", "content"):
-        attempts += 1
-        out, lat_ms = await llm_client.classify_json(cls_prompt, max_tokens=settings.classify_max_tokens, json_schema={}, shape=shape)
+    used_path = "responses"
+    deadline_ms = max(200, int(getattr(settings, "classify_deadline_ms", 1200)))
+    if settings.classify_use_responses:
+        for shape in ("string", "content"):
+            # Respect overall deadline across attempts
+            elapsed = int((_time.perf_counter() - wall_t0) * 1000)
+            remaining = max(50, deadline_ms - elapsed)
+            attempts += 1
+            try:
+                out, lat_ms = await asyncio.wait_for(
+                    llm_client.classify_json(cls_prompt, max_tokens=settings.classify_max_tokens, json_schema={}, shape=shape),
+                    timeout=remaining / 1000.0,
+                )
+            except asyncio.TimeoutError:
+                out, lat_ms = "[timeout]", remaining
+            api_ms_total += int(lat_ms or 0)
+            if out.startswith("[offline]") or out.startswith("[incomplete:") or out.startswith("[timeout]"):
+                err_note = out
+                continue
+            data = _extract_json(out) or {}
+            try:
+                _idx = data.get("index", data.get("i", None))
+                idx = int(_idx) if _idx is not None else None
+            except Exception:
+                idx = None
+            val = data.get("confidence", data.get("c", data.get("p", 0.0)))
+            try:
+                p = float(val)
+            except Exception:
+                p = 0.0
+            p = max(0.0, min(1.0, p))
+            if isinstance(idx, int) and idx in label_map:
+                cat = label_map[idx]
+                conf = p
+                raw_cat = cat
+                break
+            err_note = f"parse_error:{shape}"
+    else:
+        # If explicitly disabled responses (shouldn't be per your directive), still run one shot responses
+        attempts = 1
+        try:
+            out, lat_ms = await asyncio.wait_for(
+                llm_client.classify_json(cls_prompt, max_tokens=settings.classify_max_tokens, json_schema={}, shape="string"),
+                timeout=deadline_ms / 1000.0,
+            )
+        except asyncio.TimeoutError:
+            out, lat_ms = "[timeout]", deadline_ms
         api_ms_total += int(lat_ms or 0)
         if out.startswith("[offline]") or out.startswith("[incomplete:"):
             err_note = out
-            continue
-        data = _extract_json(out) or {}
-        try:
-            idx = int(data.get("index", data.get("i", 0)))
-        except Exception:
-            idx = None
-        val = data.get("confidence", data.get("c", data.get("p", 0.0)))
-        try:
-            p = float(val)
-        except Exception:
-            p = 0.0
-        p = max(0.0, min(1.0, p))
-        if isinstance(idx, int) and idx in label_map:
-            cat = label_map[idx]
-            conf = p
-            raw_cat = cat
-            break
-        err_note = f"parse_error:{shape}"
+        else:
+            data = _extract_json(out) or {}
+            try:
+                idx = int(data.get("index", data.get("i", 0)))
+            except Exception:
+                idx = None
+            val = data.get("confidence", data.get("c", data.get("p", 0.0)))
+            try:
+                p = float(val)
+            except Exception:
+                p = 0.0
+            p = max(0.0, min(1.0, p))
+            if isinstance(idx, int) and idx in label_map:
+                cat = label_map[idx]
+                conf = p
+                raw_cat = cat
+            else:
+                err_note = "parse_error:string"
 
     # Опционально: fallback на Chat (OpenAI) только если включено
     if not cat and getattr(settings, "fallback_classifier", False):
@@ -155,7 +216,8 @@ async def _classify(text: str) -> tuple[str, float, dict]:
         api_ms_total += int(lat_ms or 0)
         data = _extract_json(out) or {}
         try:
-            idx = int(data.get("index", data.get("i", 0)))
+            _idx = data.get("index", data.get("i", None))
+            idx = int(_idx) if _idx is not None else None
         except Exception:
             idx = None
         val = data.get("confidence", data.get("c", data.get("p", 0.0)))
@@ -184,6 +246,7 @@ async def _classify(text: str) -> tuple[str, float, dict]:
                 "attempts": attempts,
                 "api_ms_total": api_ms_total,
                 "wall_ms": wall_ms,
+                "path": used_path,
             }
             print("[cls-debug] " + _json.dumps(debug, ensure_ascii=False))
         except Exception:

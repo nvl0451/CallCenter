@@ -45,5 +45,7 @@ class Settings(BaseModel):
     # Classifier fallback (OpenAI Chat) on persistent Responses failures
     fallback_classifier: bool = bool(int(os.getenv("FALLBACK_CLASSIFIER", "0")))
     classify_chat_model: str = os.getenv("CLASSIFY_CHAT_MODEL", "gpt-4o-mini")
+    classify_use_responses: bool = bool(int(os.getenv("CLASSIFY_USE_RESPONSES", "1")))
+    classify_deadline_ms: int = int(os.getenv("CLASSIFY_DEADLINE_MS", "1200"))
 
 settings = Settings()
