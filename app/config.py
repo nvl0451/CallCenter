@@ -16,9 +16,6 @@ class Settings(BaseModel):
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     # Backwards-compat: REPLY_MAX_TOKENS overrides LLM_MAX_TOKENS
     reply_max_tokens: int = int(os.getenv("REPLY_MAX_TOKENS", os.getenv("LLM_MAX_TOKENS", "256")))
-    classify_max_tokens: int = int(os.getenv("CLASSIFY_MAX_TOKENS", "16"))
-    classify_strict: bool = bool(int(os.getenv("CLASSIFY_STRICT", "1")))
-    classify_model: str = os.getenv("CLASSIFY_MODEL", "gpt-4o-mini")
 
     # Feature flags
     enable_rag: bool = bool(int(os.getenv("ENABLE_RAG", "0")))
@@ -43,13 +40,8 @@ class Settings(BaseModel):
     docs_dir: str = os.getenv("DOCS_DIR", "./docs")
     # Debug verbosity (hide noisy cls/llm debug by default)
     debug_verbose: bool = bool(int(os.getenv("DEBUG_VERBOSE", "0")))
-    # Classifier fallback (OpenAI Chat) on persistent Responses failures
-    fallback_classifier: bool = bool(int(os.getenv("FALLBACK_CLASSIFIER", "0")))
-    classify_chat_model: str = os.getenv("CLASSIFY_CHAT_MODEL", "gpt-4o-mini")
-    classify_use_responses: bool = bool(int(os.getenv("CLASSIFY_USE_RESPONSES", "1")))
-    classify_deadline_ms: int = int(os.getenv("CLASSIFY_DEADLINE_MS", "1200"))
     # Local classifier (SBERT) settings
-    classifier_backend: str = os.getenv("CLASSIFIER_BACKEND", "responses")  # responses | sbert
+    classifier_backend: str = os.getenv("CLASSIFIER_BACKEND", "sbert")  # default to sbert
     sbert_model: str = os.getenv("SBERT_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
     sbert_device: str | None = os.getenv("SBERT_DEVICE", None)  # e.g., cpu or cuda
 

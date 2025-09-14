@@ -58,7 +58,7 @@ This document locks the deliverable scope for submission. The project ships as a
   - `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_USE_RESPONSES`
   - `ENABLE_RAG`, `RAG_USE_OPENAI_EMBEDDINGS`, `OPENAI_EMBED_MODEL`, `CHROMA_DIR`, `DOCS_DIR`, `RAG_STORAGE_DIR`, `RAG_HARD_DELETE`
   - `ENABLE_VISION`, `VISION_BACKEND`, `OPENAI_VISION_MODEL`, `VISION_ALLOW_INSECURE_DOWNLOAD`
-  - `ADMIN_TOKEN`, `SQLITE_PATH`, `REPLY_MAX_TOKENS`, `CLASSIFY_MAX_TOKENS`, `LLM_TEMPERATURE`
+  - `ADMIN_TOKEN`, `SQLITE_PATH`, `REPLY_MAX_TOKENS`, `LLM_TEMPERATURE`
   - `CLASSIFIER_BACKEND` (responses|sbert), `SBERT_MODEL`, `SBERT_DEVICE`
 - Behavior
   - No startup crashes if features disabled or keys missing
@@ -69,4 +69,3 @@ This document locks the deliverable scope for submission. The project ships as a
 - SPEC.md delivered (baseline) and SPEC_2.md implemented (admin‑first + tools)
 - Negotiator is a prototype for demonstration, not a full sales engine
 - Future work listed above; prompts can be moved to DB later if needed
-

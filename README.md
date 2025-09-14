@@ -10,7 +10,7 @@ FastAPI‑сервис с диалогом, RAG и классификацией 
 - `pip install -r requirements.txt`
 3) Настройка `.env`
 - `cp .env.example .env` и укажите `OPENAI_API_KEY`
-- (при необходимости) `OPENAI_MODEL`, `OPENAI_USE_RESPONSES`, `REPLY_MAX_TOKENS`, `CLASSIFY_MAX_TOKENS`
+- (при необходимости) `OPENAI_MODEL`, `OPENAI_USE_RESPONSES`, `REPLY_MAX_TOKENS`
 - Для RAG: `ENABLE_RAG=1`, `RAG_USE_OPENAI_EMBEDDINGS=1`
 - Для Vision: `ENABLE_VISION=1`, `VISION_BACKEND=openai` (или `clip` при наличии torch)
 4) Запуск
@@ -38,7 +38,7 @@ FastAPI‑сервис с диалогом, RAG и классификацией 
 - `OPENAI_MODEL` — чат‑модель (дефолт `gpt-5-mini`)
 - `OPENAI_USE_RESPONSES` — 1 для Responses (gpt‑5), 0 для Chat
 - `REPLY_MAX_TOKENS` — лимит токенов ответа (дефолт 256)
-- `CLASSIFY_MAX_TOKENS` — лимит для классификатора (дефолт 16)
+  
 - RAG: `ENABLE_RAG`, `RAG_USE_OPENAI_EMBEDDINGS`, `OPENAI_EMBED_MODEL`, `RAG_CHUNK_CHARS`, `RAG_CHUNK_OVERLAP`
 - Vision: `ENABLE_VISION`, `VISION_BACKEND=openai|clip`, `OPENAI_VISION_MODEL`, `VISION_ALLOW_INSECURE_DOWNLOAD`
 

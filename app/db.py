@@ -32,6 +32,16 @@ def run_migrations():
         )
         """
     )
+    # app-wide editable settings (e.g., system_base)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+        )
+        """
+    )
     # text categories with prompt
     cur.execute(
         """
@@ -278,31 +288,12 @@ def bootstrap_defaults() -> Dict[str, int]:
     # Classes
     cur.execute("SELECT COUNT(1) FROM cls_categories WHERE active=1")
     if int(cur.fetchone()[0]) == 0:
-        # Built-in prompts
-        prompts = {
-            "техподдержка": (
-                "Ты специалист техподдержки. Попроси у клиента минимально необходимые детали, "
-                "дай 1-3 шага решения, при необходимости предложи эскалацию."
-            ),
-            "продажи": (
-                "Ты менеджер по продажам. Уточни потребности, предложи подходящий тариф/пакет, "
-                "сформулируй чёткий next step (демо, счёт, пробный период)."
-            ),
-            "жалоба": (
-                "Ты сотрудник по работе с жалобами. Признай проблему, извинись, опиши, что сделаешь, "
-                "предложи компенсацию при необходимости и сроки ответа."
-            ),
-        }
-        syns_map = {
-            "техподдержка": ["поддержка", "support"],
-            "продажи": ["sales"],
-            "жалоба": ["complaint"],
-        }
-        stems_map = {
-            "техподдержка": ["ошибк", "не запуска", "проблем", "support"],
-            "продажи": ["куп", "тариф", "цен", "оплат", "счёт", "подписк"],
-            "жалоба": ["жалоб", "возврат", "refund", "дважд"],
-        }
+        # Built-in prompts and vocab
+        from .constants import (
+            DEFAULT_CLASS_PROMPTS as prompts,
+            DEFAULT_CLASS_SYNONYMS as syns_map,
+            DEFAULT_CLASS_STEMS as stems_map,
+        )
         for prio, name in enumerate(["техподдержка", "продажи", "жалоба" ][::-1]):
             cur.execute(
                 "INSERT INTO cls_categories(name, synonyms_json, stems_json, system_prompt, priority, active, updated_at) VALUES(?,?,?,?,?,1,?)",
@@ -318,68 +309,18 @@ def bootstrap_defaults() -> Dict[str, int]:
     # Vision labels
     cur.execute("SELECT COUNT(1) FROM vision_labels WHERE active=1")
     if int(cur.fetchone()[0]) == 0:
-        categories = [
-            "ошибка интерфейса",
-            "проблема с оплатой",
-            "технический сбой",
-            "вопрос по продукту",
-            "другое",
-        ]
-        clip_templates = [
-            "скриншот: {s}",
-            "интерфейс: {s}",
-            "сообщение: {s}",
-            "предупреждение: {s}",
-            "ошибка: {s}",
-            "a screenshot of {s}",
-            "ui: {s}",
-            "dialog: {s}",
-            "notice: {s}",
-        ]
-        clip_synonyms = {
-            "ошибка интерфейса": [
-                "ошибка интерфейса",
-                "сообщение об ошибке",
-                "окно ошибки",
-                "предупреждение интерфейса",
-                "interface error",
-                "ui error",
-                "error dialog",
-                "warning dialog",
-            ],
-            "проблема с оплатой": [
-                "проблема с оплатой",
-                "ошибка оплаты",
-                "payment error",
-                "billing problem",
-                "declined card",
-            ],
-            "технический сбой": [
-                "технический сбой",
-                "server error",
-                "internal error",
-                "crash",
-                "stack trace",
-            ],
-            "вопрос по продукту": [
-                "вопрос по продукту",
-                "product question",
-                "how to use",
-                "help screen",
-            ],
-            "другое": [
-                "другое",
-                "other",
-                "misc",
-            ],
-        }
-        for prio, name in enumerate(categories[::-1]):
+        from .constants import (
+            DEFAULT_VISION_CATEGORIES as _V_CATS,
+            DEFAULT_VISION_TEMPLATES as _V_TPLS,
+            DEFAULT_VISION_SYNONYMS as _V_SYNS,
+        )
+        for prio, name in enumerate(list(_V_CATS)[::-1]):
             cur.execute(
                 "INSERT INTO vision_labels(name, synonyms_json, templates_json, priority, active, updated_at) VALUES(?,?,?,?,1,?)",
                 (
                     name,
-                    json.dumps(clip_synonyms.get(name, []), ensure_ascii=False),
-                    json.dumps(clip_templates, ensure_ascii=False),
+                    json.dumps(_V_SYNS.get(name, []), ensure_ascii=False),
+                    json.dumps(_V_TPLS, ensure_ascii=False),
                     prio, _now(),
                 ),
             )
@@ -655,16 +596,33 @@ def update_stems_bulk(stems_by_name: Dict[str, list]) -> int:
 
 def update_default_stems() -> int:
     """Set improved stems for default 3 classes if they exist."""
-    stems = {
-        "техподдержка": [
-            "ошибк", "не запуска", "проблем", "что дела", "как исправ", "инструкц",
-            "шаг", "перезагруз", "переустанов", "очистк кеш", "не удаётс войт", "код ошиб", "лог"
-        ],
-        "продажи": [
-            "куп", "тариф", "цен", "оплат", "счёт", "подписк", "демо", "пробн"
-        ],
-        "жалоба": [
-            "жалоб", "вернут ден", "возврат", "списал дважд", "недоволен", "обман", "мошенн", "пожалова", "компенсац"
-        ],
-    }
+    from .constants import DEFAULT_CLASS_STEMS as stems
     return update_stems_bulk(stems)
+
+# ---- App settings (editable system-wide fields) ----
+def get_setting(name: str) -> str | None:
+    conn = connect(); cur = conn.cursor()
+    cur.execute("SELECT value FROM app_settings WHERE name=?", (name,))
+    row = cur.fetchone()
+    conn.close()
+    return None if row is None else str(row[0])
+
+def set_setting(name: str, value: str) -> int:
+    conn = connect(); cur = conn.cursor()
+    now = _now()
+    cur.execute(
+        "INSERT INTO app_settings(name,value,updated_at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (name, value, now),
+    )
+    changed = cur.rowcount or 0
+    conn.commit(); conn.close()
+    return changed
+
+def ensure_default_system_base() -> None:
+    val = get_setting("system_base")
+    if val is None:
+        from .constants import DEFAULT_SYSTEM_BASE
+        try:
+            set_setting("system_base", DEFAULT_SYSTEM_BASE)
+        except Exception:
+            pass

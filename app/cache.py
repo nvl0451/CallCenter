@@ -2,16 +2,24 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Tuple
 from . import db
+from .constants import DEFAULT_SYSTEM_BASE
 
 # In-memory caches
 _classes: List[Dict] = []
 _vision_labels: List[Dict] = []
+_system_base: str = DEFAULT_SYSTEM_BASE
 
 
 def reload_caches() -> Dict[str, int]:
-    global _classes, _vision_labels
+    global _classes, _vision_labels, _system_base
     _classes = db.fetch_active_classes()
     _vision_labels = db.fetch_active_vision_labels()
+    try:
+        _sb = db.get_setting("system_base")
+        if _sb:
+            _system_base = _sb
+    except Exception:
+        _system_base = DEFAULT_SYSTEM_BASE
     return {"classes": len(_classes), "vision_labels": len(_vision_labels)}
 
 
@@ -69,3 +77,7 @@ def classes_stems_map() -> Dict[str, List[str]]:
             stems = []
         mp[name] = [s for s in stems if isinstance(s, str) and s.strip()]
     return mp
+
+
+def system_base() -> str:
+    return _system_base

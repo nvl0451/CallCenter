@@ -37,85 +37,28 @@ def _labels_from_cache():
         rows = app_cache.vision_labels_cache()
     except Exception:
         rows = []
-    if rows:
-        import json as _json
-        names = []
-        syn_map = {}
-        tpl_map = {}
-        for r in rows:
-            name = str(r.get("name", "")).strip()
-            if not name:
-                continue
-            names.append(name)
-            try:
-                syns = _json.loads(r.get("synonyms_json") or "[]")
-            except Exception:
-                syns = []
-            try:
-                tpls = _json.loads(r.get("templates_json") or "[]")
-            except Exception:
-                tpls = []
-            syn_map[name] = [s for s in syns if isinstance(s, str) and s.strip()] or [name]
-            tpl_map[name] = [t for t in tpls if isinstance(t, str) and t.strip()]
-        if names:
-            return names, syn_map, tpl_map
-    # Fallback defaults
-    names = [
-        "ошибка интерфейса",
-        "проблема с оплатой",
-        "технический сбой",
-        "вопрос по продукту",
-        "другое",
-    ]
-    tpl = [
-        "скриншот: {s}",
-        "интерфейс: {s}",
-        "сообщение: {s}",
-        "предупреждение: {s}",
-        "ошибка: {s}",
-        "a screenshot of {s}",
-        "ui: {s}",
-        "dialog: {s}",
-        "notice: {s}",
-    ]
-    syn = {
-        "ошибка интерфейса": [
-            "ошибка интерфейса",
-            "сообщение об ошибке",
-            "окно ошибки",
-            "предупреждение интерфейса",
-            "interface error",
-            "ui error",
-            "error dialog",
-            "warning dialog",
-        ],
-        "проблема с оплатой": [
-            "проблема с оплатой",
-            "ошибка оплаты",
-            "payment error",
-            "billing problem",
-            "declined card",
-        ],
-        "технический сбой": [
-            "технический сбой",
-            "server error",
-            "internal error",
-            "crash",
-            "stack trace",
-        ],
-        "вопрос по продукту": [
-            "вопрос по продукту",
-            "product question",
-            "how to use",
-            "help screen",
-        ],
-        "другое": [
-            "другое",
-            "other",
-            "misc",
-        ],
-    }
-    return names, syn, {name: tpl for name in names}
+    import json as _json
+    names = []
+    syn_map = {}
+    tpl_map = {}
+    for r in rows or []:
+        name = str(r.get("name", "")).strip()
+        if not name:
+            continue
+        names.append(name)
+        try:
+            syns = _json.loads(r.get("synonyms_json") or "[]")
+        except Exception:
+            syns = []
+        try:
+            tpls = _json.loads(r.get("templates_json") or "[]")
+        except Exception:
+            tpls = []
+        syn_clean = [s for s in syns if isinstance(s, str) and s.strip()]
+        tpl_clean = [t for t in tpls if isinstance(t, str) and t.strip()]
+        syn_map[name] = syn_clean if syn_clean else [name]
+        tpl_map[name] = tpl_clean
+    return names, syn_map, tpl_map
 
 def _load_clip():
     global _model, _preprocess, _tokenizer
@@ -204,6 +147,8 @@ def classify_image(img: "Image.Image") -> Tuple[str, float, List[float], List[st
             image_features /= image_features.norm(dim=-1, keepdim=True)
 
             labels, syn_map, tpl_map = _labels_from_cache()
+            if not labels:
+                raise RuntimeError("No vision labels configured in DB")
             class_feats = []
             for label in labels:
                 phrases: List[str] = []
