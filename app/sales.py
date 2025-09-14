@@ -12,6 +12,7 @@ def get(session_id: str) -> Dict[str, Any]:
         "intent": None,
         "plan_candidate": None,
         "plan_confidence": 0.0,
+        "plan_locked": False,
         "seats": None,
         "channels": [],
         "sso_required": None,

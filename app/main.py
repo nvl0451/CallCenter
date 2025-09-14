@@ -762,13 +762,18 @@ async def agent_message(req: AgentMessageRequest):
     if not text:
         raise HTTPException(400, "text required")
     # Sales session state and opportunistic slot extraction
-    st = sales.get(session_id)
+    st_before = sales.get(session_id)
     try:
         slot_guess = sales.parse_message_slots(text)
-        if slot_guess:
-            sales.update(session_id, **slot_guess)
     except Exception:
-        pass
+        slot_guess = {}
+    if slot_guess:
+        sales.update(session_id, **slot_guess)
+    st = sales.get(session_id)
+    # Track material info changes (affects re-pitch)
+    material_keys = {k for k in (slot_guess or {}).keys() if k in ("seats", "channels", "sso_required", "analytics_required", "billing")}
+    new_email = (st_before.get("admin_email") is None and bool(st.get("admin_email")))
+    new_billing = (st_before.get("billing") not in ("monthly", "annual") and st.get("billing") in ("monthly", "annual"))
     # Persist user message for conversational context
     try:
         add_message(session_id, "user", text)
@@ -791,7 +796,10 @@ async def agent_message(req: AgentMessageRequest):
 
     # 2) If purchase intent, try to detect plan (Basic/Plus/Business)
     plan = None; plan_conf = 0.0
-    if intent == "продажи" and budget_ok():
+    locked = bool(st.get("plan_locked"))
+    if locked and not material_keys:
+        plan = st.get("plan_candidate"); plan_conf = float(st.get("plan_confidence") or 0.9)
+    elif intent == "продажи" and budget_ok():
         labels = ["Basic", "Plus", "Business"]
         # Prefer SBERT-based quick classifier among labels
         try:
@@ -822,10 +830,13 @@ async def agent_message(req: AgentMessageRequest):
     except Exception:
         pass
 
-    # 3) If confident plan, fetch KB snippet via RAG
+    # 3) If confident plan, optionally fetch KB snippet via RAG (avoid re-pitch when locked and no new info)
     docs = []
     rag_ms = 0
-    if plan and plan_conf >= 0.65 and settings.enable_rag and rag_available and budget_ok():
+    do_pitch = bool(plan and plan_conf >= 0.65 and settings.enable_rag and rag_available and budget_ok())
+    if do_pitch and locked and not material_keys and not new_billing and not new_email:
+        do_pitch = False
+    if do_pitch:
         calls += 1; tools_used.append("rag_search")
         ru = {"Basic":"Базовый","Plus":"Плюс","Business":"Бизнес"}.get(plan, plan)
         q = f"Тариф {ru} (план {plan}) цена, ключевые функции, ограничения"
@@ -858,18 +869,19 @@ async def agent_message(req: AgentMessageRequest):
             if m:
                 return m.group(0)
         return t
-    # Confident plan path with RAG
-    if plan and plan_conf >= 0.65 and docs:
+    # Confident plan path (with or without DOC depending on availability)
+    if plan and plan_conf >= 0.65:
         ru = {"Basic":"Базовый","Plus":"Плюс","Business":"Бизнес"}.get(plan, plan)
         import re as _re
         sections = []
-        for d in docs:
-            raw = d.get("document", "") or ""
-            sec = _extract_plan_section(raw, plan, ru)
-            # Remove generic inheritance lines to avoid "всё из Базового" phrasing in LLM output
-            sec_lines = [ln for ln in sec.splitlines() if not _re.search(r"(?i)(вс.? из базов|everything in basic)", ln)]
-            sec_clean = "\n".join(sec_lines)
-            sections.append(sec_clean[:1500])
+        if docs:
+            for d in docs:
+                raw = d.get("document", "") or ""
+                sec = _extract_plan_section(raw, plan, ru)
+                # Remove generic inheritance lines to avoid repetition
+                sec_lines = [ln for ln in sec.splitlines() if not _re.search(r"(?i)(вс.? из базов|everything in basic)", ln)]
+                sec_clean = "\n".join(sec_lines)
+                sections.append(sec_clean[:1500])
         context = "\n\n".join(sections)
         included_hint = {
             "Basic": "(до 3 пользователей включено)",
@@ -880,6 +892,15 @@ async def agent_message(req: AgentMessageRequest):
         greeted = bool(st_now_for_prompt.get("greeted"))
         has_billing = st_now_for_prompt.get("billing") in ("monthly", "annual")
         has_email = bool(st_now_for_prompt.get("admin_email"))
+        # Personalize with compact slot header
+        slot_header = []
+        if st_now_for_prompt.get("seats"):
+            slot_header.append(f"Пользователи: {st_now_for_prompt.get('seats')}")
+        if st_now_for_prompt.get("channels"):
+            slot_header.append("Каналы: " + ", ".join(st_now_for_prompt.get("channels") or []))
+        if st_now_for_prompt.get("billing"):
+            slot_header.append("Оплата: " + ("месяц" if st_now_for_prompt.get("billing")=="monthly" else "год"))
+        slot_header_txt = ("; ".join(slot_header)) if slot_header else ""
         # Build CTA text depending on what is already provided
         if has_billing and has_email:
             bill_txt = "помесячной" if st_now_for_prompt.get("billing") == "monthly" else "годовой"
@@ -892,23 +913,23 @@ async def agent_message(req: AgentMessageRequest):
         else:
             cta_text = f"Хотите выбрать период оплаты (месяц/год; за год — скидка 20%)? И пришлите e‑mail администратора для приглашения команды {included_hint}."
         if not greeted:
+            # First pitch: only include benefits if docs fetched; personalize with slot header
             sys = SYSTEM_BASE + (
                 "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Пиши по‑русски, живым человеческим языком (без канцеляризмов и англицизмов)." \
                 "\nФормат ответа:" \
-                "\n— Короткий приветствующий лид из 1 фразы (без общих рассуждений). Если параметры подходят, начни с ‘Отличный выбор!’." \
-                "\n— Цена: 1 короткая фраза." \
-                "\n— Ключевые выгоды плана: 3–5 маркеров «— …» только про этот план (не упоминай другие планы и не пиши ‘всё из Базового’)." \
-                "\n— Заверши дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’). Если период оплаты или e‑mail уже указаны — не спрашивай повторно; подтверди это и двигайся вперёд. Заверши такой фразой: " + cta_text + " Пиши просто и по‑человечески." \
-                "\nИспользуй только факты из [DOC]."
+                + ("\n— Короткий приветственный лид (без общих рассуждений). " + (slot_header_txt if slot_header_txt else "")) \
+                + ("\n— Цена: 1 короткая фраза." if docs else "") \
+                + ("\n— Ключевые выгоды плана: 3–5 маркеров только при наличии [DOC]." if docs else "") \
+                + "\n— Заверши дружелюбной фразой‑призывом: " + cta_text + " (не используй слова ‘Следующий шаг’)." \
+                + ("\nИспользуй только факты из [DOC]." if docs else "")
             )
         else:
+            # Follow-up: confirm fit briefly; avoid repeating benefits unless we fetched new DOC
             sys = SYSTEM_BASE + (
                 "\nСтиль: тёплый, дружелюбный, уверенный менеджер по продажам мужского пола. Пиши по‑русски, живым человеческим языком (без канцеляризмов и англицизмов)." \
                 "\nФормат ответа:" \
-                "\n— Цена: 1 короткая фраза." \
-                "\n— Ключевые выгоды плана: 3–5 маркеров «— …» только про этот план (не упоминай другие планы и не пиши ‘всё из Базового’)." \
-                "\n— Заверши дружелюбной фразой‑призывом (не используй слова ‘Следующий шаг’). Если период оплаты или e‑mail уже указаны — не спрашивай повторно; подтверди это и двигайся вперёд. Заверши такой фразой: " + cta_text + " Пиши просто и по‑человечески." \
-                "\nИспользуй только факты из [DOC]."
+                + ("\n— Коротко подтвердить соответствие плана без приветствия." + ("\n— Цена: 1 короткая фраза." if docs else "")) \
+                + "\n— Заверши дружелюбной фразой‑призывом: " + cta_text + " (без повторения выгод)."
             )
         # Build conversational context (last 8 turns)
         convo = [{"role": "system", "content": sys}]
@@ -919,8 +940,12 @@ async def agent_message(req: AgentMessageRequest):
         for role, content in hist[-8:]:
             if role in ("user", "assistant"):
                 convo.append({"role": role, "content": content})
-        # Append task instruction with DOC
-        convo.append({"role": "user", "content": f"Пользователь хочет оформить план {plan}. На основе [DOC] опиши цену, ключевые выгоды и мягко предложи, что сделать дальше (без слов ‘Следующий шаг’).\n\n[DOC]\n{context}"})
+        # Append task instruction depending on availability of DOC
+        if docs:
+            task = f"Пользователь хочет оформить план {plan}. На основе [DOC] опиши цену, ключевые выгоды и мягко предложи, что сделать дальше (без слов ‘Следующий шаг’).\n\n[DOC]\n{context}"
+        else:
+            task = f"Пользователь хочет оформить план {plan}. Коротко подтверди соответствие плана и предложи понятное действие без повторения списка выгод."
+        convo.append({"role": "user", "content": task})
         messages = convo
         try:
             _lt0 = _t.perf_counter()
@@ -986,9 +1011,9 @@ async def agent_message(req: AgentMessageRequest):
                 quote_ms = int((_t.perf_counter() - _qt0) * 1000)
                 reply = (reply + "\n\n— Оформил предложение: " + quote_obj["url"] +
                          f" (отправил на {quote_obj['sent_to']}).")
-                sales.update(session_id, stage="quoted")
+                sales.update(session_id, stage="quoted", plan_locked=True)
             else:
-                sales.update(session_id, stage="confirm")
+                sales.update(session_id, stage="confirm", plan_locked=True)
         except Exception:
             pass
     else:
