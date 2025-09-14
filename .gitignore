@@ -9,3 +9,4 @@ __pycache__/
 chroma_db/
 storage/
 callcenter.sqlite3
+.DS_Store
