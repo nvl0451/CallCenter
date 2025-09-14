@@ -78,7 +78,6 @@ def bootstrap_defaults() -> Dict[str, int]:
                     None,
                     None,
                     0,
-                    1,
                 ),
             )
             inserted["rag_docs"] += 1

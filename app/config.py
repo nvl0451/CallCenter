@@ -1,6 +1,9 @@
 from __future__ import annotations
+from dotenv import load_dotenv
 import os
 from pydantic import BaseModel
+
+load_dotenv()
 
 class Settings(BaseModel):
     # OpenAI settings
@@ -46,3 +49,4 @@ class Settings(BaseModel):
     sbert_device: str | None = os.getenv("SBERT_DEVICE", None)  # e.g., cpu or cuda
 
 settings = Settings()
+print(f"Loaded ADMIN_TOKEN: '{settings.admin_token}'")
