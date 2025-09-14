@@ -91,7 +91,3 @@ Log per turn:
 - Price negotiation: allowed vs. not allowed → outcomes.
 - Security objection: compliance_info → proceed.
 - Out‑of‑scope message → polite redirect → proceed.
-
----
-
-This blueprint keeps up‑front decisions fast and decisive, while allowing the dialog model to guide when the customer needs help. Tools are deliberately minimal and JSON‑strict so they can be mocked in tests and evolved later without changing the conversation style.

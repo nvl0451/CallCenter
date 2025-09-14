@@ -13,6 +13,8 @@ from ..services import sales as sales
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
+# Prototype sales funnel Negotiator agent
+
 
 @router.post("/message", response_model=AgentMessageResponse)
 async def agent_message(req: AgentMessageRequest):
